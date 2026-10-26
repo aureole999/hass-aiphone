@@ -1,4 +1,4 @@
-"""Share one incoming video track with the recorder and native HA WebRTC viewers."""
+"""Share incoming audio/video with the recorder and native HA WebRTC viewers."""
 
 from __future__ import annotations
 
@@ -13,10 +13,9 @@ from aiortc.sdp import candidate_from_sdp
 
 
 class _ViewerTrack(MediaStreamTrack):
-    kind = "video"
-
     def __init__(self, proxy: MediaStreamTrack, owner: LiveVideoRelay) -> None:
         super().__init__()
+        self.kind = proxy.kind
         self._proxy = proxy
         self._owner = owner
 
@@ -38,14 +37,22 @@ class LiveVideoRelay:
     def __init__(self) -> None:
         self._relay = MediaRelay()
         self._source: MediaStreamTrack | None = None
+        self._audio_source: MediaStreamTrack | None = None
         self.ready = asyncio.Event()
         self.viewers: set[_ViewerTrack] = set()
         self.viewers_changed = asyncio.Event()
 
     def attach(self, source: MediaStreamTrack) -> MediaStreamTrack:
-        self.end()
-        self._source = source
-        self.ready.set()
+        # SDP may announce audio before video. Replacing one kind must not
+        # discard the other kind or disconnect its existing viewers.
+        for track in tuple(self.viewers):
+            if track.kind == source.kind:
+                track.stop()
+        if source.kind == "audio":
+            self._audio_source = source
+        else:
+            self._source = source
+            self.ready.set()
         return self._relay.subscribe(source)
 
     async def subscribe(self, timeout: float = 30) -> MediaStreamTrack:
@@ -53,6 +60,16 @@ class LiveVideoRelay:
         source = self._source
         if source is None or source.readyState != "live":
             raise MediaStreamError("The doorbell video session has ended")
+        track = _ViewerTrack(self._relay.subscribe(source, buffered=False), self)
+        self.viewers.add(track)
+        self.viewers_changed.set()
+        return track
+
+    def subscribe_audio(self) -> MediaStreamTrack | None:
+        """Use an announced audio track without waiting for its first RTP packet."""
+        source = self._audio_source
+        if source is None or source.readyState != "live":
+            return None
         track = _ViewerTrack(self._relay.subscribe(source, buffered=False), self)
         self.viewers.add(track)
         self.viewers_changed.set()
@@ -68,6 +85,7 @@ class LiveVideoRelay:
     def end(self) -> None:
         self.ready.clear()
         self._source = None
+        self._audio_source = None
         for track in tuple(self.viewers):
             track.stop()
 
@@ -76,7 +94,7 @@ class LiveVideoRelay:
 class _Session:
     pc: RTCPeerConnection
     setup: asyncio.Task | None = None
-    track: MediaStreamTrack | None = None
+    tracks: list[MediaStreamTrack] = field(default_factory=list)
     remote_ready: bool = False
     candidates: list[Any] = field(default_factory=list)
 
@@ -84,8 +102,13 @@ class _Session:
 class BrowserVideo:
     """A receive-only camera bridge: no microphone, cloud signaling or credentials."""
 
-    def __init__(self, get_track: Callable[[], Awaitable[MediaStreamTrack]]) -> None:
+    def __init__(
+        self,
+        get_track: Callable[[], Awaitable[MediaStreamTrack]],
+        get_audio_track: Callable[[], MediaStreamTrack | None] | None = None,
+    ) -> None:
         self._get_track = get_track
+        self._get_audio_track = get_audio_track
         self._sessions: dict[str, _Session] = {}
 
     async def offer(self, sdp: str, session_id: str, answer: Callable[[str], None]) -> None:
@@ -119,16 +142,26 @@ class BrowserVideo:
         transceivers = pc.getTransceivers()
         if not any(t.kind == "video" and t.direction != "inactive" for t in transceivers):
             raise ValueError("The browser did not offer a video track")
-        for transceiver in transceivers:
-            if transceiver.kind == "audio":
-                transceiver.direction = "inactive"
-        track = session.track = await self._get_track()
+        track = await self._get_track()
+        session.tracks.append(track)
 
         @track.on("ended")
         def track_ended():
             asyncio.create_task(self.close(session_id))
 
         pc.addTrack(track)
+        for transceiver in transceivers:
+            if transceiver.kind == "video":
+                transceiver.direction = "sendonly"
+            elif transceiver.kind == "audio":
+                audio = self._get_audio_track() if self._get_audio_track else None
+                if audio is None:
+                    transceiver.direction = "inactive"
+                else:
+                    session.tracks.append(audio)
+                    pc.addTrack(audio)
+                    # Even an offer with a microphone gets output audio only.
+                    transceiver.direction = "sendonly"
         await pc.setLocalDescription(await pc.createAnswer())
         if self._sessions.get(session_id) is session:
             answer(pc.localDescription.sdp)
@@ -158,8 +191,8 @@ class BrowserVideo:
         if session.setup and not session.setup.done() and session.setup is not asyncio.current_task():
             session.setup.cancel()
             await asyncio.gather(session.setup, return_exceptions=True)
-        if session.track:
-            session.track.stop()
+        for track in session.tracks:
+            track.stop()
         await session.pc.close()
 
     async def aclose(self) -> None:

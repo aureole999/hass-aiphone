@@ -69,7 +69,7 @@ This integration talks directly to the unit's AWS IoT cloud over mTLS — the sa
 
 | Entity | Description |
 |---|---|
-| `camera.<unit>_entrance` | Native WebRTC live video (v0.2.0b3), sharing the incoming track with recordings. Opens Monitor when idle; snapshots use the live frame or the latest finalized mp4. Browser playback is video-only. |
+| `camera.<unit>_entrance` | Native WebRTC live video (v0.2.0b3) and received audio (v0.2.0b4), sharing incoming tracks with recordings. Opens Monitor when idle; snapshots use the live frame or the latest finalized mp4. Playback does not activate a microphone or answer calls. |
 
 ### Buttons
 

@@ -62,7 +62,9 @@ class AiphoneEntranceCamera(Camera):
         )
         self._cached_path: Path | None = None
         self._cached_jpeg: bytes | None = None
-        self._browser_video = BrowserVideo(coordinator.video.async_viewer_track)
+        self._browser_video = BrowserVideo(
+            coordinator.video.async_viewer_track, coordinator.video.viewer_audio_track
+        )
 
     async def async_added_to_hass(self) -> None:
         self.async_on_remove(
@@ -75,7 +77,7 @@ class AiphoneEntranceCamera(Camera):
     async def async_handle_async_webrtc_offer(
         self, offer_sdp: str, session_id: str, send_message: WebRTCSendMessage
     ) -> None:
-        """Play the existing incoming video; never accept or transmit audio."""
+        """Play incoming audio/video without accepting calls or publishing audio."""
         try:
             await self._browser_video.offer(
                 offer_sdp, session_id, lambda sdp: send_message(WebRTCAnswer(sdp))

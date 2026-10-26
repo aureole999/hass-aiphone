@@ -2,14 +2,17 @@
 
 import asyncio
 import importlib.util
+import math
+import struct
 import sys
 import types
 from enum import IntFlag
+from fractions import Fraction
 from pathlib import Path
 
 import av
 import pytest
-from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
+from aiortc import AudioStreamTrack, RTCConfiguration, RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
 from aiortc.contrib.media import MediaRecorder
 from aiortc.mediastreams import MediaStreamError
 from webrtc_models import RTCIceCandidateInit
@@ -42,10 +45,49 @@ class TestPattern(VideoStreamTrack):
             self.reading = False
 
 
-async def open_browser(bridge, name):
+class TestTone(AudioStreamTrack):
+    """8 kHz decoded doorbell-like audio, or an announced track with no packets."""
+
+    __test__ = False
+
+    def __init__(self, packets=True):
+        super().__init__()
+        self.packets = packets
+        self.samples = 0
+        self.reading = False
+        self.stopped = asyncio.Event()
+
+    async def recv(self):
+        assert not self.reading, "Multiple consumers are reading upstream audio"
+        self.reading = True
+        try:
+            if not self.packets:
+                await self.stopped.wait()
+                raise MediaStreamError
+            await asyncio.sleep(0.02)
+            if self.readyState != "live":
+                raise MediaStreamError
+            frame = av.AudioFrame(format="s16", layout="mono", samples=160)
+            frame.sample_rate = 8000
+            frame.pts, frame.time_base = self.samples, Fraction(1, 8000)
+            frame.planes[0].update(b"".join(
+                struct.pack("<h", int(10000 * math.sin(2 * math.pi * 440 * i / 8000)))
+                for i in range(self.samples, self.samples + 160)
+            ))
+            self.samples += 160
+            return frame
+        finally:
+            self.reading = False
+
+    def stop(self):
+        self.stopped.set()
+        super().stop()
+
+
+async def open_browser(bridge, name, expect_audio=False, audio_direction="recvonly"):
     browser = RTCPeerConnection(RTCConfiguration(iceServers=[]))
     browser.addTransceiver("video", direction="recvonly")
-    browser.addTransceiver("audio", direction="recvonly")
+    browser.addTransceiver("audio", direction=audio_direction)
     video = asyncio.get_running_loop().create_future()
 
     @browser.on("track")
@@ -58,7 +100,8 @@ async def open_browser(bridge, name):
         answers = []
         await bridge.offer(browser.localDescription.sdp, name, answers.append)
         assert len(answers) == 1
-        assert "a=inactive" in answers[0].split("m=audio", 1)[1]
+        direction = "sendonly" if expect_audio else "inactive"
+        assert f"a={direction}" in answers[0].split("m=audio", 1)[1]
         await browser.setRemoteDescription(RTCSessionDescription(answers[0], "answer"))
         return browser, await asyncio.wait_for(video, 5)
     except BaseException:
@@ -74,7 +117,7 @@ async def test_two_viewers_and_recording_share_real_video(tmp_path):
     recorder = MediaRecorder(str(recording))
     recorder.addTrack(relay.attach(source))
     await recorder.start()
-    bridge = BrowserVideo(relay.subscribe)
+    bridge = BrowserVideo(relay.subscribe, relay.subscribe_audio)
     browsers = []
     try:
         first, second = await asyncio.gather(open_browser(bridge, "one"), open_browser(bridge, "two"))
@@ -108,6 +151,81 @@ async def test_two_viewers_and_recording_share_real_video(tmp_path):
         frames = list(container.decode(video=0))
     assert len(frames) >= 2
     assert frames[-1].pts > frames[0].pts
+
+
+@pytest.mark.asyncio
+async def test_monitor_audio_reaches_two_browsers_and_recording(tmp_path):
+    video, audio = TestPattern(), TestTone()
+    relay = LiveVideoRelay()
+    recording = tmp_path / "audio-video.mp4"
+    recorder = MediaRecorder(str(recording))
+    # Real SDP may announce audio first; video attach must keep that track.
+    recorder.addTrack(relay.attach(audio))
+    recorder.addTrack(relay.attach(video))
+    await recorder.start()
+    bridge = BrowserVideo(relay.subscribe, relay.subscribe_audio)
+    browsers = []
+    try:
+        for name in ("first", "second"):
+            browser, track = await open_browser(
+                bridge, name, expect_audio=True, audio_direction="sendrecv",
+            )
+            browsers.append(browser)
+            await asyncio.wait_for(track.recv(), 5)
+            incoming_audio = next(r.track for r in browser.getReceivers() if r.track.kind == "audio")
+            frame = await asyncio.wait_for(incoming_audio.recv(), 5)
+            assert frame.sample_rate == 48000  # browser negotiated Opus
+            raw = bytes(frame.planes[0])[:frame.samples * len(frame.layout.channels) * 2]
+            assert max(abs(s[0]) for s in struct.iter_unpack("<h", raw)) > 1000
+        assert len(relay.viewers) == 4
+        await bridge.close("first")
+        assert len(relay.viewers) == 2
+        assert audio.readyState == video.readyState == "live"
+        # Audio ending alone must not close the remaining video player.
+        next(t for t in bridge._sessions["second"].tracks if t.kind == "audio").stop()
+        await asyncio.sleep(0)
+        assert "second" in bridge._sessions
+    finally:
+        await bridge.aclose()
+        for browser in browsers:
+            await browser.close()
+        await recorder.stop()
+        audio.stop()
+        video.stop()
+        relay.end()
+        await asyncio.sleep(0.05)
+    with av.open(str(recording)) as container:
+        assert {s.type for s in container.streams} == {"audio", "video"}
+        assert sum(frame.samples for frame in container.decode(audio=0)) > 0
+    with av.open(str(recording)) as container:
+        assert sum(1 for _ in container.decode(video=0)) > 1
+
+
+@pytest.mark.asyncio
+async def test_announced_audio_without_packets_does_not_block_video():
+    video, audio = TestPattern(), TestTone(packets=False)
+    relay = LiveVideoRelay()
+    recording_audio = relay.attach(audio)
+    recording_video = relay.attach(video)
+    bridge = BrowserVideo(relay.subscribe, relay.subscribe_audio)
+    browser = None
+    try:
+        browser, track = await asyncio.wait_for(
+            open_browser(bridge, "no-audio-packets", expect_audio=True), 5,
+        )
+        a = await asyncio.wait_for(track.recv(), 5)
+        b = await asyncio.wait_for(track.recv(), 3)
+        assert b.pts > a.pts
+    finally:
+        await bridge.aclose()
+        if browser:
+            await browser.close()
+        recording_audio.stop()
+        recording_video.stop()
+        audio.stop()
+        video.stop()
+        relay.end()
+        await asyncio.sleep(0.05)
 
 
 @pytest.mark.asyncio
@@ -289,7 +407,9 @@ def test_camera_declares_native_stream_and_keeps_existing_identity(monkeypatch):
     relay = LiveVideoRelay()
     coordinator = types.SimpleNamespace(
         device_id="existing-id", device_mac="test-mac",
-        video=types.SimpleNamespace(async_viewer_track=relay.subscribe),
+        video=types.SimpleNamespace(
+            async_viewer_track=relay.subscribe, viewer_audio_track=relay.subscribe_audio,
+        ),
     )
     entity = module.AiphoneEntranceCamera(coordinator)
     assert entity._attr_supported_features & Feature.STREAM
