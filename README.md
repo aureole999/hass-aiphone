@@ -16,12 +16,11 @@ need device testing. `sent` means local sending completed, not audible playback.
 Remote hangup remains unimplemented; closing the sender does not promise to end
 the call on the unit. This fork does not yet provide RTSP or go2rtc integration.
 
-The experimental code currently lives on **`feat/prerecorded-reply`**. Until
-its PR is merged, install that branch manually by downloading the
-[branch ZIP](https://github.com/aureole999/hass-aiphone/archive/refs/heads/feat/prerecorded-reply.zip)
-and copying its `custom_components/aiphone` directory. Installing the default
-branch through HACS will not include this feature until it is merged.
-Put a recording in
+The experimental code is included in **`master`**. Add this fork as a HACS
+custom repository (Integration category), or download the
+[master ZIP](https://github.com/aureole999/hass-aiphone/archive/refs/heads/master.zip)
+and copy its `custom_components/aiphone` directory. Restart Home Assistant
+after installation. Put a recording in
 `/config/aiphone/replies/reply.wav`; select its basename in the integration
 options. Press the reply button only during an incoming ring. Local audio is
 limited to 30 seconds / 10 MiB and is never automatically played on a ring.

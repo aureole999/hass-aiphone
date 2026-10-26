@@ -6,7 +6,7 @@
 
 ## 安装与准备
 
-1. 测试代码目前在 **`feat/prerecorded-reply` 分支**，默认 `master` 尚未合并。先下载[分支 ZIP](https://github.com/aureole999/hass-aiphone/archive/refs/heads/feat/prerecorded-reply.zip)，将其中的 `custom_components/aiphone` 文件夹复制到 HA 配置目录的 `custom_components/` 下，然后重启 Home Assistant。PR 合并后才可以通过 HACS 自定义仓库 `https://github.com/aureole999/hass-aiphone`（Integration 类别）安装默认分支的新版。
+1. 测试代码已包含在默认 **`master` 分支**。在 HACS 中添加自定义仓库 `https://github.com/aureole999/hass-aiphone`，类别选 Integration，安装后重启 Home Assistant。也可以下载 [master ZIP](https://github.com/aureole999/hass-aiphone/archive/refs/heads/master.zip)，将其中的 `custom_components/aiphone` 文件夹复制到 HA 配置目录的 `custom_components/` 下，然后重启。
 2. 按上游说明，在室内机进入「端末追加」模式，并在 Home Assistant 的「设置 → 设备与服务 → 添加集成」中添加 Aiphone。它注册为新的客户端，仍然依赖 Aiphone 云服务。
 3. 将自己的预录文件放入 HA 配置目录下的 `aiphone/replies/`。例如 `/config/aiphone/replies/reply.wav`。
 4. 在该集成的「配置／选项」中设置音频文件名，默认 `reply.wav`。只填文件名，不接受 URL、目录或指向目录外的符号链接。支持 WAV、MP3、M4A、OGG、FLAC，最长 30 秒、文件最大 10 MiB。首次试验建议 3–5 秒的普通语音。
