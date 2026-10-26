@@ -641,6 +641,9 @@ class VideoCapture:
     async def _passive_teardown(self) -> None:
         rec, pc, path = self._passive_recorder, self._passive_pc, self._passive_path
         cid = self._passive_cid
+        self._talk_owner = None
+        if self._uplink:
+            self._uplink.enabled = False
         if self._passive_cid:
             await self._release_cloud(self._passive_cid, (self._accepted or self._answer_requested) and not self._remote_ended)
         if self._uplink:
@@ -814,6 +817,9 @@ class VideoCapture:
     async def _monitor_teardown(self) -> None:
         rec, pc1, pc2, path = self._mon_recorder, self._mon_pc1, self._mon_pc2, self._mon_path
         cid = self._mon_cid
+        self._talk_owner = None
+        if self._uplink:
+            self._uplink.enabled = False
         if self._mon_cid:
             await self._release_cloud(self._mon_cid, not self._remote_ended)
         if self._uplink:
