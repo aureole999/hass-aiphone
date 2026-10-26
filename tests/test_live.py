@@ -9,6 +9,7 @@ import types
 from enum import IntFlag
 from fractions import Fraction
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import av
 import pytest
@@ -417,3 +418,131 @@ def test_camera_declares_native_stream_and_keeps_existing_identity(monkeypatch):
     assert callable(entity.async_on_webrtc_candidate)
     assert callable(entity.close_webrtc_session)
     assert entity._attr_unique_id == "existing-id_entrance"
+
+
+def monitor_for_phone_test(media_module, reply_cid="monitor", result=200):
+    messages = []
+    coord = types.SimpleNamespace(
+        mqtt_connected=True, cliid="client", sndtpc="unit/send/client", rcvtpc="unit/recv/client",
+    )
+    video = media_module.VideoCapture(coord)
+
+    def publish(message):
+        messages.append(message)
+        if reply_cid:
+            video.on_signal("24022", {"HEADER": {"CID": reply_cid, "RSLT": result}})
+        return True
+
+    coord.publish = publish
+    video._mon_cid = "monitor"
+    video._mon_pc2 = object()
+    video.live.ready.set()
+    return video, messages
+
+
+@pytest.mark.asyncio
+async def test_monitor_phone_button_uses_observed_request_and_matching_ack(media_module):
+    video, messages = monitor_for_phone_test(media_module)
+    assert await video.async_start_monitor_talk()
+    header = messages[0]["HEADER"]
+    assert header["MID"] == "23022"
+    assert header["CID"] == "monitor"
+    assert header["CKIND"] == 0
+    assert header["RSLT"] == 0
+    assert messages[0]["BODY"] == {}
+    assert video._monitor_talking
+    assert video._mon_fut_24022 is None
+    assert await video.async_start_monitor_talk()
+    assert len(messages) == 1
+
+
+@pytest.mark.parametrize("reply_cid,result,error", [
+    ("other-session", 200, "No response"),
+    ("monitor", 486, "rejected"),
+])
+@pytest.mark.asyncio
+async def test_monitor_phone_button_never_accepts_other_session_or_rejection(
+    media_module, monkeypatch, reply_cid, result, error,
+):
+    video, messages = monitor_for_phone_test(media_module, reply_cid, result)
+    monkeypatch.setattr(media_module, "MONITOR_TALK_TIMEOUT_S", 0.01)
+    with pytest.raises(RuntimeError, match=error):
+        await video.async_start_monitor_talk()
+    assert not video._monitor_talking
+    assert video._mon_fut_24022 is None
+    assert len(messages) == 1
+
+
+@pytest.mark.asyncio
+async def test_monitor_phone_button_requires_ready_monitor(media_module):
+    video, messages = monitor_for_phone_test(media_module)
+    video.live.ready.clear()
+    with pytest.raises(RuntimeError, match="wait for the video"):
+        await video.async_start_monitor_talk()
+    assert not messages
+
+
+@pytest.mark.asyncio
+async def test_monitor_teardown_finishes_pending_phone_request(media_module):
+    video, _ = monitor_for_phone_test(media_module, reply_cid=None)
+
+    class Peer:
+        async def getStats(self):
+            return {}
+
+        async def close(self):
+            pass
+
+    video._mon_pc2 = Peer()
+    request = asyncio.create_task(video.async_start_monitor_talk())
+    await asyncio.sleep(0)
+    await video._monitor_teardown()
+    with pytest.raises(RuntimeError, match="session ended"):
+        await request
+    assert not video._monitor_talk_lock.locked()
+
+
+@pytest.mark.parametrize("state,monitor,expected_mid", [
+    ("idle", "monitor", "23022"),
+    ("ringing", "monitor", "24000"),
+    ("idle", None, None),
+])
+@pytest.mark.asyncio
+async def test_answer_routes_monitor_and_ring_separately(
+    media_module, monkeypatch, state, monitor, expected_mid,
+):
+    for name in ("paho", "paho.mqtt", "paho.mqtt.client"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    sys.modules["paho"].mqtt = sys.modules["paho.mqtt"]
+    sys.modules["paho.mqtt"].client = sys.modules["paho.mqtt.client"]
+    core = types.ModuleType("homeassistant.core")
+    core.HomeAssistant = object
+    core.callback = lambda function: function
+    config = types.ModuleType("homeassistant.config_entries")
+    config.ConfigEntry = object
+    monkeypatch.setitem(sys.modules, core.__name__, core)
+    monkeypatch.setitem(sys.modules, config.__name__, config)
+    path = Path(__file__).parents[1] / "custom_components/aiphone/coordinator.py"
+    spec = importlib.util.spec_from_file_location("aiphone_test.coordinator", path)
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, module)
+    spec.loader.exec_module(module)
+    messages = []
+    video = types.SimpleNamespace(_mon_cid=monitor, async_start_monitor_talk=AsyncMock(return_value=True))
+    coord = types.SimpleNamespace(
+        doorbell_state=state, _active_cid="old-ring", video=video,
+        cliid="client", sndtpc="send", rcvtpc="recv",
+        publish=lambda message: messages.append(message) or True,
+    )
+    result = await module.AiphoneCoordinator.async_answer_call(coord)
+    assert result is (expected_mid is not None)
+    if expected_mid == "23022":
+        video.async_start_monitor_talk.assert_awaited_once()
+        assert not messages
+    elif expected_mid == "24000":
+        assert messages[0]["HEADER"]["MID"] == "24000"
+        assert messages[0]["HEADER"]["CID"] == "old-ring"
+        video.async_start_monitor_talk.assert_not_called()
+    else:
+        assert not messages
+        video.async_start_monitor_talk.assert_not_called()

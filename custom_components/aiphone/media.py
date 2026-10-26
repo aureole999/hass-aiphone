@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     from .coordinator import AiphoneCoordinator
 
 _LOGGER = logging.getLogger(__name__)
+MONITOR_TALK_TIMEOUT_S = 8
 
 
 def now_sid() -> str:
@@ -194,6 +195,9 @@ class VideoCapture:
         self._mon_fut_24021: asyncio.Future | None = None
         self._mon_fut_31011: asyncio.Future | None = None
         self._mon_fut_31012: asyncio.Future | None = None
+        self._mon_fut_24022: asyncio.Future | None = None
+        self._monitor_talking = False
+        self._monitor_talk_lock = asyncio.Lock()
 
     @property
     def recordings_dir(self) -> Path:
@@ -221,6 +225,43 @@ class VideoCapture:
     def viewer_audio_track(self) -> MediaStreamTrack | None:
         """Share incoming audio without sending an answer-call command."""
         return self.live.subscribe_audio()
+
+    async def async_start_monitor_talk(self) -> bool:
+        """Mirror the official app's phone button (23022 -> matching 24022)."""
+        async with self._monitor_talk_lock:
+            cid = self._mon_cid
+            if self._closing or not self.coord.mqtt_connected:
+                raise RuntimeError("Aiphone is not connected")
+            if not cid or self._mon_pc2 is None or not self.live.ready.is_set():
+                raise RuntimeError("Open Monitor and wait for the video before pressing Answer")
+            if self._monitor_talking:
+                return True
+            future = self._mon_fut_24022 = asyncio.get_running_loop().create_future()
+            try:
+                if not self.coord.publish({"HEADER": {
+                    "MID": "23022", "VER": "1.0", "SYS": "2",
+                    "CLIID": self.coord.cliid, "CID": cid,
+                    "CKIND": 0, "RECKIND": 0, "AVID": 0,
+                    "SNDTPC": self.coord.sndtpc, "RCVTPC": self.coord.rcvtpc,
+                    "RSLT": 0, "REASON": 0, "LEN": 0, "SID": now_sid(),
+                }, "BODY": {}}):
+                    raise RuntimeError("Unable to send the monitor talk request")
+                try:
+                    result = await asyncio.wait_for(future, MONITOR_TALK_TIMEOUT_S)
+                except TimeoutError as err:
+                    raise RuntimeError("No response to the monitor phone-button request") from err
+                if result != 200:
+                    raise RuntimeError(f"Monitor talk was rejected (24022 RSLT={result})")
+                if self._mon_cid != cid:
+                    raise RuntimeError("The monitor session ended before talk was enabled")
+                self._monitor_talking = True
+                _LOGGER.info("Monitor phone-button request accepted (24022 RSLT=200)")
+                return True
+            finally:
+                if not future.done():
+                    future.cancel()
+                if self._mon_fut_24022 is future:
+                    self._mon_fut_24022 = None
 
     @property
     def latest_recording(self) -> Path | None:
@@ -253,6 +294,8 @@ class VideoCapture:
                 self._mon_fut_31011.set_result(body.get("SDP", ""))
             elif mid == "31012" and self._mon_fut_31012 and not self._mon_fut_31012.done():
                 self._mon_fut_31012.set_result(head.get("RSLT"))
+            elif mid == "24022" and self._mon_fut_24022 and not self._mon_fut_24022.done():
+                self._mon_fut_24022.set_result(head.get("RSLT"))
 
     # ------------------------------------------------------------------
     # PASSIVE — triggered by MID 23001 (doorbell ring)
@@ -499,7 +542,7 @@ class VideoCapture:
             "MID": "23021", "VER": "1.0", "SYS": "2",
             "CLIID": self.coord.cliid, "PCLIID": pcliid,
             "DSP1": self.coord.termname, "DSP2": "@",
-            "CKIND": 1, "CID": cid,
+            "CKIND": 0, "CID": cid,
             "RECKIND": 0, "AVID": 0,
             "SNDTPC": self.coord.sndtpc, "RCVTPC": self.coord.rcvtpc,
             "REASON": 0, "TMKIND": 5, "TMID": 1281,
@@ -563,6 +606,10 @@ class VideoCapture:
         self._mon_path = self._mon_cid = None
         self._mon_fut_31001 = self._mon_fut_24021 = None
         self._mon_fut_31011 = self._mon_fut_31012 = None
+        self._monitor_talking = False
+        if self._mon_fut_24022 and not self._mon_fut_24022.done():
+            self._mon_fut_24022.set_exception(RuntimeError("The monitor session ended"))
+        self._mon_fut_24022 = None
         if rec is not None:
             try:
                 await rec.stop()

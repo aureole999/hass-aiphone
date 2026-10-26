@@ -66,7 +66,11 @@ class AiphoneAnswerButton(ButtonEntity):
         self._attr_device_info = _device_info(coordinator)
 
     async def async_press(self) -> None:
-        self._coord.async_answer_call()
+        try:
+            if not await self._coord.async_answer_call():
+                raise HomeAssistantError("No ringing call or active Monitor is available")
+        except RuntimeError as err:
+            raise HomeAssistantError(str(err)) from err
 
 
 class _ReplyButtonBase(ButtonEntity):

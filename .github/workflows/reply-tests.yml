@@ -19,5 +19,5 @@ jobs:
           cache: pip
       - run: python -m pip install -r requirements-test.txt
       - run: python -m compileall -q custom_components
-      - run: ruff check custom_components/aiphone/config_flow.py custom_components/aiphone/camera.py custom_components/aiphone/live.py custom_components/aiphone/media.py custom_components/aiphone/media_diagnostics.py custom_components/aiphone/diagnostics.py custom_components/aiphone/coordinator.py custom_components/aiphone/reply.py custom_components/aiphone/reply_files.py tests --select E9,F
+      - run: ruff check custom_components/aiphone/config_flow.py custom_components/aiphone/camera.py custom_components/aiphone/live.py custom_components/aiphone/media.py custom_components/aiphone/media_diagnostics.py custom_components/aiphone/diagnostics.py custom_components/aiphone/coordinator.py custom_components/aiphone/button.py custom_components/aiphone/reply.py custom_components/aiphone/reply_files.py tests --select E9,F
       - run: python -m pytest -q
