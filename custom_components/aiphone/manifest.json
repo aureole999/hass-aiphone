@@ -5,6 +5,9 @@
     "@aureole999"
   ],
   "config_flow": true,
+  "dependencies": [
+    "http"
+  ],
   "documentation": "https://github.com/aureole999/hass-aiphone",
   "integration_type": "device",
   "iot_class": "cloud_push",
@@ -17,8 +20,5 @@
     "pyee>=13.0.0",
     "google-crc32c>=1.1"
   ],
-  "version": "0.2.0b7",
-  "dependencies": [
-    "http"
-  ]
+  "version": "0.2.0b7"
 }
