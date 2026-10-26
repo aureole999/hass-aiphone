@@ -1,4 +1,4 @@
-"""Camera: snapshot from the latest captured mp4 (passive ring or monitor)."""
+"""Camera: native WebRTC video plus snapshots from the shared incoming feed."""
 from __future__ import annotations
 
 import asyncio
@@ -6,7 +6,13 @@ import io
 import logging
 from pathlib import Path
 
-from homeassistant.components.camera import Camera
+from homeassistant.components.camera import (
+    Camera,
+    CameraEntityFeature,
+    WebRTCAnswer,
+    WebRTCError,
+    WebRTCSendMessage,
+)
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import CONNECTION_NETWORK_MAC, DeviceInfo
@@ -15,6 +21,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN, SIGNAL_CAMERA_REFRESH
 from .coordinator import AiphoneCoordinator
+from .live import BrowserVideo
 
 # When a passive capture is in progress but no live frame has been decoded
 # yet, wait briefly polling for one. Empirically: track event arrives ~0.2s,
@@ -40,6 +47,7 @@ class AiphoneEntranceCamera(Camera):
     _attr_has_entity_name = True
     _attr_name = "Entrance"
     _attr_icon = "mdi:doorbell-video"
+    _attr_supported_features = CameraEntityFeature.STREAM
 
     def __init__(self, coordinator: AiphoneCoordinator) -> None:
         super().__init__()
@@ -54,11 +62,37 @@ class AiphoneEntranceCamera(Camera):
         )
         self._cached_path: Path | None = None
         self._cached_jpeg: bytes | None = None
+        self._browser_video = BrowserVideo(coordinator.video.async_viewer_track)
 
     async def async_added_to_hass(self) -> None:
         self.async_on_remove(
             async_dispatcher_connect(self.hass, SIGNAL_CAMERA_REFRESH, self._on_refresh)
         )
+
+    async def async_will_remove_from_hass(self) -> None:
+        await self._browser_video.aclose()
+
+    async def async_handle_async_webrtc_offer(
+        self, offer_sdp: str, session_id: str, send_message: WebRTCSendMessage
+    ) -> None:
+        """Play the existing incoming video; never accept or transmit audio."""
+        try:
+            await self._browser_video.offer(
+                offer_sdp, session_id, lambda sdp: send_message(WebRTCAnswer(sdp))
+            )
+        except Exception:
+            _LOGGER.exception("Unable to start Entrance live video")
+            send_message(WebRTCError(
+                "aiphone_video_failed",
+                "Unable to start Aiphone video. Check the integration logs and connection.",
+            ))
+
+    async def async_on_webrtc_candidate(self, session_id, candidate) -> None:
+        await self._browser_video.candidate(session_id, candidate)
+
+    @callback
+    def close_webrtc_session(self, session_id: str) -> None:
+        self.hass.async_create_task(self._browser_video.close(session_id))
 
     @callback
     def _on_refresh(self) -> None:
