@@ -27,5 +27,44 @@
     "abort": {
       "already_configured": "This Aiphone unit + client is already configured."
     }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Prerecorded reply",
+        "description": "Experimental: accepts a currently ringing call and attempts to send one local recording. Put the file under /config/aiphone/replies/. Audible playback and remote hangup are not yet verified.",
+        "data": {
+          "reply_audio_file": "Reply audio filename"
+        }
+      }
+    },
+    "error": {
+      "invalid_reply_filename": "Use an audio filename without a path or URL (WAV, MP3, M4A, OGG or FLAC)."
+    }
+  },
+  "entity": {
+    "button": {
+      "play_reply": {
+        "name": "Play prerecorded reply (experimental)"
+      },
+      "stop_reply": {
+        "name": "Stop reply sender"
+      }
+    },
+    "sensor": {
+      "reply_status": {
+        "name": "Reply status",
+        "state": {
+          "idle": "Idle",
+          "preparing": "Preparing",
+          "connecting": "Connecting",
+          "accepting": "Accepting call",
+          "sending": "Sending audio",
+          "sent": "Audio sent (speaker unverified)",
+          "stopped": "Stopped",
+          "failed": "Failed"
+        }
+      }
+    }
   }
 }

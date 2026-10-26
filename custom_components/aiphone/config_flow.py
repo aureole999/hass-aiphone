@@ -14,6 +14,7 @@ from typing import Any
 import voluptuous as vol
 
 from homeassistant import config_entries
+from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
 
 from .const import (
@@ -25,9 +26,12 @@ from .const import (
     CONF_SNDTPC,
     CONF_TERMNAME,
     CONF_UNIT_MAC,
+    CONF_REPLY_AUDIO_FILE,
+    DEFAULT_REPLY_AUDIO_FILE,
     CONFIG_VERSION,
     DOMAIN,
 )
+from .reply_files import validate_reply_filename
 from .pairing import (
     CloudRegistrationFailed,
     OTPVerifyFailed,
@@ -45,6 +49,11 @@ class AiphoneConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Aiphone."""
 
     VERSION = CONFIG_VERSION
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry: config_entries.ConfigEntry):
+        return AiphoneOptionsFlow(config_entry)
 
     def __init__(self) -> None:
         self._termname: str = "PiBridge"
@@ -137,4 +146,31 @@ class AiphoneConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             step_id="failed",
             data_schema=vol.Schema({}),
             errors={"base": self._error_key or "unknown"},
+        )
+
+
+class AiphoneOptionsFlow(config_entries.OptionsFlow):
+    """Select one local recording; never start a call while configuring."""
+
+    def __init__(self, entry: config_entries.ConfigEntry) -> None:
+        self._entry = entry
+
+    async def async_step_init(self, user_input=None) -> FlowResult:
+        errors = {}
+        if user_input is not None:
+            try:
+                filename = validate_reply_filename(user_input[CONF_REPLY_AUDIO_FILE])
+            except ValueError:
+                errors[CONF_REPLY_AUDIO_FILE] = "invalid_reply_filename"
+            else:
+                return self.async_create_entry(title="", data={
+                    **self._entry.options, CONF_REPLY_AUDIO_FILE: filename,
+                })
+        default = (user_input or self._entry.options).get(
+            CONF_REPLY_AUDIO_FILE, DEFAULT_REPLY_AUDIO_FILE
+        )
+        return self.async_show_form(
+            step_id="init",
+            data_schema=vol.Schema({vol.Required(CONF_REPLY_AUDIO_FILE, default=default): str}),
+            errors=errors,
         )

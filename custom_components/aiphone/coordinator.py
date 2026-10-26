@@ -26,6 +26,9 @@ from .const import (
     CONF_SNDTPC,
     CONF_TERMNAME,
     CONF_UNIT_MAC,
+    CONF_REPLY_AUDIO_FILE,
+    DEFAULT_REPLY_AUDIO_FILE,
+    REPLY_AUDIO_SUBDIR,
     DEFAULT_IOT_HOST,
     DEFAULT_IOT_PORT,
     DOMAIN,
@@ -37,6 +40,7 @@ from .const import (
     STATE_RINGING,
 )
 from .media import VideoCapture, now_sid
+from .reply import ReplyPublisher
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -70,6 +74,7 @@ class AiphoneCoordinator:
         self._timer_handle: asyncio.TimerHandle | None = None
 
         self.video = VideoCapture(self)
+        self.reply = ReplyPublisher(self)
 
     # -------------------------------------------------------------------
     # lifecycle
@@ -79,6 +84,7 @@ class AiphoneCoordinator:
         await self.hass.async_add_executor_job(self._connect)
 
     async def async_stop(self) -> None:
+        await self.reply.stop()
         await self.video.aclose()
         if self._client is not None:
             await self.hass.async_add_executor_job(self._client.loop_stop)
@@ -124,9 +130,12 @@ class AiphoneCoordinator:
         wildcard = self.unit_mac + "/#"
         client.subscribe(wildcard, qos=1)
         _LOGGER.info("AWS IoT connected; subscribed %s", wildcard)
+        self.hass.loop.call_soon_threadsafe(self.notify_reply_state)
 
     def _on_disconnect(self, client, userdata, rc):
         _LOGGER.warning("AWS IoT disconnected rc=%s — paho will reconnect", rc)
+        self.hass.loop.call_soon_threadsafe(self.reply.cancel)
+        self.hass.loop.call_soon_threadsafe(self.notify_reply_state)
 
     def _on_message(self, client, userdata, msg):
         try:
@@ -138,13 +147,30 @@ class AiphoneCoordinator:
     # -------------------------------------------------------------------
     # outbound (called from media.py and entities)
     # -------------------------------------------------------------------
-    def publish(self, msg: dict[str, Any]) -> None:
+    def publish(self, msg: dict[str, Any]) -> bool:
         """Publish a JSON envelope to the unit's SNDTPC."""
-        if self._client is None:
+        if self._client is None or not self._client.is_connected():
             _LOGGER.warning("publish called before MQTT client connected")
-            return
+            return False
         payload = json.dumps(msg, separators=(",", ":")) + "\n"
-        self._client.publish(self.sndtpc, payload, qos=1)
+        result = self._client.publish(self.sndtpc, payload, qos=1)
+        return result.rc == mqtt.MQTT_ERR_SUCCESS
+
+    @property
+    def active_call_id(self) -> str | None:
+        return self._active_cid
+
+    @property
+    def mqtt_connected(self) -> bool:
+        return self._client is not None and self._client.is_connected()
+
+    def notify_reply_state(self) -> None:
+        async_dispatcher_send(self.hass, SIGNAL_STATE_UPDATE)
+
+    async def async_play_reply(self) -> None:
+        filename = self.entry.options.get(CONF_REPLY_AUDIO_FILE, DEFAULT_REPLY_AUDIO_FILE)
+        directory = Path(self.hass.config.path(REPLY_AUDIO_SUBDIR))
+        await self.reply.play(directory, filename)
 
     async def async_start_monitor(
         self, duration_s: int = MONITOR_DEFAULT_DURATION_S
@@ -242,6 +268,7 @@ class AiphoneCoordinator:
         # Forward signaling MIDs to the video capture state machines
         if mid in ("31001", "24021", "31011", "31012"):
             self.video.on_signal(mid, raw)
+        self.reply.on_signal(mid, raw)
 
     def _set_doorbell(self, new_state: str) -> None:
         if new_state == self.doorbell_state:

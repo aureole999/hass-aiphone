@@ -13,6 +13,9 @@ CONF_CERT_PEM = "cert_pem"
 CONF_SECKEY_PEM = "seckey_pem"
 CONF_TERMNAME = "termname"
 CONF_UNIT_MAC = "unit_mac"
+CONF_REPLY_AUDIO_FILE = "reply_audio_file"
+DEFAULT_REPLY_AUDIO_FILE = "reply.wav"
+REPLY_AUDIO_SUBDIR = "aiphone/replies"
 
 # v1 (legacy)
 CONF_REGIST_RESPONSE = "regist_response_path"

@@ -25,6 +25,7 @@ async def async_setup_entry(
             AiphoneDoorbellState(coord),
             AiphoneLastCaller(coord),
             AiphoneLastRecording(coord),
+            AiphoneReplyStatus(coord),
         ]
     )
 
@@ -77,6 +78,29 @@ class AiphoneLastCaller(_AiphoneSensorBase):
     @property
     def native_value(self) -> str:
         return self._coord.last_caller or ""
+
+
+class AiphoneReplyStatus(_AiphoneSensorBase):
+    """Report sending progress, never claim that the door speaker was heard."""
+
+    _attr_translation_key = "reply_status"
+    _attr_icon = "mdi:account-voice"
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_options = ["idle", "preparing", "connecting", "accepting", "sending",
+                     "sent", "stopped", "failed"]
+
+    def __init__(self, coordinator: AiphoneCoordinator) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{coordinator.device_id}_reply_status"
+
+    @property
+    def native_value(self) -> str:
+        return self._coord.reply.status
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        return {"last_error": self._coord.reply.last_error,
+                "speaker_playback_verified": False}
 
 
 class AiphoneLastRecording(SensorEntity):

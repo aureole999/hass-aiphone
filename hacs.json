@@ -1,6 +1,8 @@
 {
-    "name": "Aiphone WP-2MED Intercom",
-    "homeassistant": "2024.3.0",
-    "render_readme": true,
-    "country": ["JP"]
+  "name": "Aiphone WP-2MED — prerecorded reply test",
+  "homeassistant": "2024.3.0",
+  "render_readme": true,
+  "country": [
+    "JP"
+  ]
 }

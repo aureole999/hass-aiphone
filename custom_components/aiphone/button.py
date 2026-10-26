@@ -4,11 +4,15 @@ from __future__ import annotations
 from homeassistant.components.button import ButtonEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.core import callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.device_registry import CONNECTION_NETWORK_MAC, DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
 
-from .const import DOMAIN
+from .const import DOMAIN, SIGNAL_STATE_UPDATE, STATE_RINGING
 from .coordinator import AiphoneCoordinator
+from .reply import ReplyError
 
 
 async def async_setup_entry(
@@ -20,6 +24,8 @@ async def async_setup_entry(
     async_add_entities([
         AiphoneMonitorButton(coord),
         AiphoneAnswerButton(coord),
+        AiphoneReplyButton(coord),
+        AiphoneStopReplyButton(coord),
     ])
 
 
@@ -48,7 +54,7 @@ class AiphoneMonitorButton(ButtonEntity):
 
 
 class AiphoneAnswerButton(ButtonEntity):
-    """Accept the currently-ringing call. Unit stops ringing; audio opens."""
+    """Request acceptance of a call; audio behavior requires device validation."""
 
     _attr_has_entity_name = True
     _attr_name = "Answer"
@@ -61,3 +67,63 @@ class AiphoneAnswerButton(ButtonEntity):
 
     async def async_press(self) -> None:
         self._coord.async_answer_call()
+
+
+class _ReplyButtonBase(ButtonEntity):
+    _attr_has_entity_name = True
+    _attr_should_poll = False
+
+    def __init__(self, coordinator: AiphoneCoordinator) -> None:
+        self._coord = coordinator
+        self._attr_device_info = _device_info(coordinator)
+
+    async def async_added_to_hass(self) -> None:
+        self.async_on_remove(async_dispatcher_connect(
+            self.hass, SIGNAL_STATE_UPDATE, self._update
+        ))
+
+    @callback
+    def _update(self) -> None:
+        self.async_write_ha_state()
+
+
+class AiphoneReplyButton(_ReplyButtonBase):
+    """Explicitly accept an incoming ring and attempt one prerecorded reply."""
+
+    _attr_translation_key = "play_reply"
+    _attr_icon = "mdi:account-voice"
+
+    def __init__(self, coordinator: AiphoneCoordinator) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{coordinator.device_id}_play_reply"
+
+    @property
+    def available(self) -> bool:
+        return (
+            self._coord.mqtt_connected
+            and self._coord.doorbell_state == STATE_RINGING
+            and self._coord.active_call_id is not None
+            and not self._coord.reply.busy
+        )
+
+    async def async_press(self) -> None:
+        try:
+            await self._coord.async_play_reply()
+        except ReplyError as err:
+            raise HomeAssistantError(str(err)) from err
+
+
+class AiphoneStopReplyButton(_ReplyButtonBase):
+    _attr_translation_key = "stop_reply"
+    _attr_icon = "mdi:stop"
+
+    def __init__(self, coordinator: AiphoneCoordinator) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{coordinator.device_id}_stop_reply"
+
+    @property
+    def available(self) -> bool:
+        return self._coord.reply.busy
+
+    async def async_press(self) -> None:
+        await self._coord.reply.stop()

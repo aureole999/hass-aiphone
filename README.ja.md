@@ -1,3 +1,5 @@
+> This is an experimental fork. See [the fork README](README.md) and [中文说明](README.zh-CN.md) for prerecorded reply setup and limitations. The upstream documentation follows.
+
 # Aiphone WP-2MED — Home Assistant 統合
 
 [![hacs_badge](https://img.shields.io/badge/HACS-Custom-41BDF5.svg)](https://github.com/hacs/integration)
