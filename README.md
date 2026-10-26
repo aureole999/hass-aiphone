@@ -1,3 +1,41 @@
+# Aiphone WP-2MED — experimental prerecorded replies
+
+Fork maintained at **https://github.com/aureole999/hass-aiphone**. [中文安装与测试说明](README.zh-CN.md).
+
+This fork adds a manual **Play prerecorded reply (experimental)** button for an
+existing incoming ring, a local audio-file option, a stop-sender button and a
+reply-status sensor. It retains the upstream integration domain and existing
+entity IDs. Developing and publishing this fork does not pair with a device.
+The new reply feature runs only on a manual button press; upstream automatic
+ring-triggered video recording remains in place after installation and pairing.
+
+**Hardware status: unverified on a real WP-2MED.** The audio publisher is tested
+against another local aiortc endpoint, not Aiphone's cloud. The incoming-call
+publisher signaling sequence and audio routing to the entrance speaker still
+need device testing. `sent` means local sending completed, not audible playback.
+Remote hangup remains unimplemented; closing the sender does not promise to end
+the call on the unit. This fork does not yet provide RTSP or go2rtc integration.
+
+Install this fork as a HACS custom integration, or copy its
+`custom_components/aiphone` directory. Put a recording in
+`/config/aiphone/replies/reply.wav`; select its basename in the integration
+options. Press the reply button only during an incoming ring. Local audio is
+limited to 30 seconds / 10 MiB and is never automatically played on a ring.
+The file is decoded and resampled completely before answering; the sender emits
+silence until negotiation and a matching acceptance event are observed.
+
+The code uses a `30001/31001` publisher based on the upstream monitor flow with
+the existing ring CID, then requests `24000 RSLT=200`. It cancels on call end,
+a new call, another client's acceptance, MQTT disconnection, stop or unload.
+No speculative door-release or cloud-hangup messages are added.
+
+See [README.zh-CN.md](README.zh-CN.md) for setup, limitations and local tests.
+The original project is [yufeikang/hass-aiphone](https://github.com/yufeikang/hass-aiphone).
+Its documentation follows below and describes **upstream** behavior; upstream
+production claims do not apply to the new experimental audio sender.
+
+---
+
 # Aiphone WP-2MED — Home Assistant Integration
 
 [![hacs_badge](https://img.shields.io/badge/HACS-Custom-41BDF5.svg)](https://github.com/hacs/integration)
