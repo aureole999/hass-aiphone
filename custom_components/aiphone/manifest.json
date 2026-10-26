@@ -1,12 +1,14 @@
 {
   "domain": "aiphone",
-  "name": "Aiphone (WP-2MED, VKZ-R)",
-  "codeowners": ["@yufeikang"],
+  "name": "Aiphone WP-2MED — prerecorded reply test",
+  "codeowners": [
+    "@aureole999"
+  ],
   "config_flow": true,
-  "documentation": "https://github.com/yufeikang/hass-aiphone",
+  "documentation": "https://github.com/aureole999/hass-aiphone",
   "integration_type": "device",
   "iot_class": "cloud_push",
-  "issue_tracker": "https://github.com/yufeikang/hass-aiphone/issues",
+  "issue_tracker": "https://github.com/aureole999/hass-aiphone/issues",
   "requirements": [
     "paho-mqtt>=1.6.1",
     "av>=10.0.0",
@@ -15,5 +17,5 @@
     "pyee>=13.0.0",
     "google-crc32c>=1.1"
   ],
-  "version": "0.1.2"
+  "version": "0.2.0b1"
 }
