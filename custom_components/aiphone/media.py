@@ -218,6 +218,10 @@ class VideoCapture:
             self._monitor_request = self.coord.hass.async_create_task(self.monitor_capture())
         return await self.live.subscribe()
 
+    def viewer_audio_track(self) -> MediaStreamTrack | None:
+        """Share incoming audio without sending an answer-call command."""
+        return self.live.subscribe_audio()
+
     @property
     def latest_recording(self) -> Path | None:
         try:
@@ -259,6 +263,7 @@ class VideoCapture:
         await self._lock.acquire()
         self._capture_task = asyncio.current_task()
         self._passive_ended.clear()
+        self.live.end()
         self._latest_video_frame = None
         try:
             await self._passive_run(cid, dsp1)
@@ -314,7 +319,7 @@ class VideoCapture:
             if track.kind == "video":
                 rec.addTrack(self.live.attach(_PassthroughVideoTrack(track, self)))
             else:
-                rec.addTrack(track)
+                rec.addTrack(self.live.attach(track))
         self._passive_pc = pc
         self._passive_recorder = rec
 
@@ -428,6 +433,7 @@ class VideoCapture:
             return
         async with self._lock:
             self._capture_task = asyncio.current_task()
+            self.live.end()
             self._latest_video_frame = None
             try:
                 await self._monitor_run(duration_s)
@@ -467,7 +473,7 @@ class VideoCapture:
             if track.kind == "video":
                 rec.addTrack(self.live.attach(_PassthroughVideoTrack(track, self)))
             else:
-                rec.addTrack(track)
+                rec.addTrack(self.live.attach(track))
         self._mon_pc2 = pc2
         self._mon_recorder = rec
 
