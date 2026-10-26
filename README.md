@@ -69,7 +69,7 @@ This integration talks directly to the unit's AWS IoT cloud over mTLS — the sa
 
 | Entity | Description |
 |---|---|
-| `camera.<unit>_entrance` | JPEG snapshot — uses the **live frame** from any in-progress capture; falls back to the most recent finalized mp4 |
+| `camera.<unit>_entrance` | Native WebRTC live video (v0.2.0b3), sharing the incoming track with recordings. Opens Monitor when idle; snapshots use the live frame or the latest finalized mp4. Browser playback is video-only. |
 
 ### Buttons
 
@@ -113,7 +113,7 @@ WP-2MED ──── AWS IoT Core (Tokyo) ───┐
 
 ## Requirements
 
-- Home Assistant 2024.3 or newer (Python 3.11+)
+- Home Assistant 2025.6 or newer (native asynchronous WebRTC camera API)
 - An Aiphone **WP-2MED** unit on the same LAN as Home Assistant during initial pairing (subsequent operation is internet-only)
 - Outbound HTTPS to `api.aiphone-app.net` (only during pairing)
 - Outbound MQTT to `*.iot.ap-northeast-1.amazonaws.com:8883` (steady state)

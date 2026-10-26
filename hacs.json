@@ -1,6 +1,6 @@
 {
   "name": "Aiphone WP-2MED — prerecorded reply test",
-  "homeassistant": "2024.3.0",
+  "homeassistant": "2025.6.0",
   "render_readme": true,
   "country": [
     "JP"

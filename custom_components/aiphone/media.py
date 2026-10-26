@@ -14,7 +14,6 @@ prevents the both-active deadlock we hit before.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import re
 import time
@@ -43,6 +42,7 @@ from .const import (
     SDP_OFFER_GATHER_TIMEOUT_S,
     SIGNAL_CAMERA_REFRESH,
 )
+from .live import LiveVideoRelay
 
 if TYPE_CHECKING:
     from .coordinator import AiphoneCoordinator
@@ -171,6 +171,11 @@ class VideoCapture:
         self.coord = coord
         self._lock = asyncio.Lock()
         self._latest_video_frame: Any = None  # av.VideoFrame; lazily JPEG-encoded
+        self.live = LiveVideoRelay()
+        self._capture_task: asyncio.Task | None = None
+        self._monitor_request: asyncio.Task | None = None
+        self._passive_ended = asyncio.Event()
+        self._closing = False
 
         # passive (doorbell ring)
         self._passive_pc: RTCPeerConnection | None = None
@@ -202,6 +207,16 @@ class VideoCapture:
         if frame is None:
             return None
         return await self.coord.hass.async_add_executor_job(_frame_to_jpeg, frame)
+
+    async def async_viewer_track(self) -> MediaStreamTrack:
+        """Reuse a ring/monitor capture, or start monitoring without answering."""
+        if self._closing or not self.coord.mqtt_connected:
+            raise RuntimeError("Aiphone is not connected")
+        if not self._lock.locked() and (
+            self._monitor_request is None or self._monitor_request.done()
+        ):
+            self._monitor_request = self.coord.hass.async_create_task(self.monitor_capture())
+        return await self.live.subscribe()
 
     @property
     def latest_recording(self) -> Path | None:
@@ -239,8 +254,12 @@ class VideoCapture:
     # PASSIVE — triggered by MID 23001 (doorbell ring)
     # ------------------------------------------------------------------
     async def passive_capture(self, cid: str, dsp1: str) -> None:
-        if not await self._lock.acquire():
+        if self._closing or self._lock.locked():
             return
+        await self._lock.acquire()
+        self._capture_task = asyncio.current_task()
+        self._passive_ended.clear()
+        self._latest_video_frame = None
         try:
             await self._passive_run(cid, dsp1)
         except asyncio.CancelledError:
@@ -249,6 +268,7 @@ class VideoCapture:
             _LOGGER.exception("passive capture failed")
         finally:
             await self._passive_teardown()
+            self._capture_task = None
             self._lock.release()
 
     async def _passive_run(self, cid: str, dsp1: str) -> None:
@@ -292,7 +312,7 @@ class VideoCapture:
                 # stats below to confirm packets actually arrive.
                 _LOGGER.info("🎤 AUDIO TRACK ATTACHED — recorder will receive frames if RTP flows")
             if track.kind == "video":
-                rec.addTrack(_PassthroughVideoTrack(track, self))
+                rec.addTrack(self.live.attach(_PassthroughVideoTrack(track, self)))
             else:
                 rec.addTrack(track)
         self._passive_pc = pc
@@ -357,7 +377,9 @@ class VideoCapture:
         # Hold; coordinator's 24002 handler will call stop()
         try:
             # Cap at RING_TIMEOUT_S * 2 in case 24002 never arrives
-            await asyncio.sleep(120)
+            await asyncio.wait_for(self._passive_ended.wait(), timeout=120)
+        except TimeoutError:
+            pass
         except asyncio.CancelledError:
             pass
         finally:
@@ -365,13 +387,18 @@ class VideoCapture:
 
     async def passive_finalize(self, delay_s: int = PASSIVE_HOLD_AFTER_END_S) -> None:
         """Called from coordinator on 24002 — wait briefly then stop."""
-        if self._passive_pc is None:
+        pc = self._passive_pc
+        if pc is None:
             return
         await asyncio.sleep(delay_s)
-        await self._passive_teardown()
+        if self._passive_pc is pc:
+            # Let the owning capture task tear down and release its lock now.
+            self._passive_ended.set()
 
     async def _passive_teardown(self) -> None:
         rec, pc, path = self._passive_recorder, self._passive_pc, self._passive_path
+        self.live.end()
+        self._latest_video_frame = None
         self._passive_pc = self._passive_recorder = None
         self._passive_path = self._passive_cid = None
         self._passive_offer_fut = None
@@ -394,10 +421,14 @@ class VideoCapture:
     # ACTIVE — monitor button press
     # ------------------------------------------------------------------
     async def monitor_capture(self, duration_s: int = MONITOR_DEFAULT_DURATION_S) -> None:
+        if self._closing:
+            return
         if self._lock.locked():
             _LOGGER.warning("monitor: another capture in progress, skipping")
             return
         async with self._lock:
+            self._capture_task = asyncio.current_task()
+            self._latest_video_frame = None
             try:
                 await self._monitor_run(duration_s)
             except asyncio.CancelledError:
@@ -406,10 +437,12 @@ class VideoCapture:
                 _LOGGER.exception("monitor capture failed")
             finally:
                 await self._monitor_teardown()
+                self._capture_task = None
 
     async def _monitor_run(self, duration_s: int) -> None:
         # PC #1 — publisher placeholder
         pc1 = RTCPeerConnection(RTCConfiguration(iceServers=[]))
+        self._mon_pc1 = pc1
         pc1.addTransceiver("audio", direction="sendrecv")
         offer1 = await pc1.createOffer()
         await pc1.setLocalDescription(RTCSessionDescription(_strip_extra_fp(offer1.sdp), "offer"))
@@ -419,7 +452,6 @@ class VideoCapture:
         sdp_offer1 = pc1.localDescription.sdp
         cid = self.coord.cliid + now_sid()
         self._mon_cid = cid
-        self._mon_pc1 = pc1
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
         self._mon_path = self.recordings_dir / f"monitor-{ts}.mp4"
         _LOGGER.info("🎥 monitor cid=%s -> %s", cid[-30:], self._mon_path)
@@ -433,7 +465,7 @@ class VideoCapture:
         def _on_track(track):
             _LOGGER.info("🎥 monitor track: %s", track.kind)
             if track.kind == "video":
-                rec.addTrack(_PassthroughVideoTrack(track, self))
+                rec.addTrack(self.live.attach(_PassthroughVideoTrack(track, self)))
             else:
                 rec.addTrack(track)
         self._mon_pc2 = pc2
@@ -504,15 +536,23 @@ class VideoCapture:
 
         await rec.start()
         _LOGGER.info("🎬 monitor recording, holding %ss", duration_s)
-        await asyncio.sleep(duration_s)
+        await self.live.hold_monitor(duration_s)
 
     async def aclose(self) -> None:
         """Coordinator shutdown — drop any in-flight capture cleanly."""
+        self._closing = True
+        tasks = {self._capture_task, self._monitor_request} - {None, asyncio.current_task()}
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         await self._passive_teardown()
         await self._monitor_teardown()
 
     async def _monitor_teardown(self) -> None:
         rec, pc1, pc2, path = self._mon_recorder, self._mon_pc1, self._mon_pc2, self._mon_path
+        self.live.end()
+        self._latest_video_frame = None
         self._mon_pc1 = self._mon_pc2 = self._mon_recorder = None
         self._mon_path = self._mon_cid = None
         self._mon_fut_31001 = self._mon_fut_24021 = None

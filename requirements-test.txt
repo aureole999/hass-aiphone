@@ -3,3 +3,4 @@ pytest>=8,<10
 pytest-asyncio>=0.24
 ruff>=0.9
 voluptuous>=0.15
+webrtc-models>=0.3,<1
