@@ -299,21 +299,6 @@ async def test_monitor_stays_open_until_last_viewer_leaves():
         relay.end()
 
 
-@pytest.fixture
-def media_module(monkeypatch):
-    """Stub only HA host plumbing and the auto-install shim, not the media code."""
-    deps = types.ModuleType("aiphone_test._deps")
-    deps.ensure_runtime_deps = lambda: None
-    dispatcher = types.ModuleType("homeassistant.helpers.dispatcher")
-    dispatcher.async_dispatcher_send = lambda *args: None
-    monkeypatch.setitem(sys.modules, deps.__name__, deps)
-    monkeypatch.setitem(sys.modules, dispatcher.__name__, dispatcher)
-    path = Path(__file__).parents[1] / "custom_components/aiphone/media.py"
-    spec = importlib.util.spec_from_file_location("aiphone_test.media", path)
-    module = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, spec.name, module)
-    spec.loader.exec_module(module)
-    return module
 
 
 @pytest.mark.asyncio
@@ -424,6 +409,7 @@ def monitor_for_phone_test(media_module, reply_cid="monitor", result=200):
     messages = []
     coord = types.SimpleNamespace(
         mqtt_connected=True, cliid="client", sndtpc="unit/send/client", rcvtpc="unit/recv/client",
+        call_answered=lambda: None, call_ended=lambda *args: None,
     )
     video = media_module.VideoCapture(coord)
 
@@ -504,7 +490,7 @@ async def test_monitor_teardown_finishes_pending_phone_request(media_module):
 
 @pytest.mark.parametrize("state,monitor,expected_mid", [
     ("idle", "monitor", "23022"),
-    ("ringing", "monitor", "24000"),
+    ("ringing", "monitor", "24002"),
     ("idle", None, None),
 ])
 @pytest.mark.asyncio
@@ -528,7 +514,8 @@ async def test_answer_routes_monitor_and_ring_separately(
     monkeypatch.setitem(sys.modules, spec.name, module)
     spec.loader.exec_module(module)
     messages = []
-    video = types.SimpleNamespace(_mon_cid=monitor, async_start_monitor_talk=AsyncMock(return_value=True))
+    video = types.SimpleNamespace(_mon_cid=monitor, async_start_monitor_talk=AsyncMock(return_value=True),
+                                  async_answer_ring=AsyncMock(return_value=True))
     coord = types.SimpleNamespace(
         doorbell_state=state, _active_cid="old-ring", video=video,
         cliid="client", sndtpc="send", rcvtpc="recv",
@@ -539,9 +526,9 @@ async def test_answer_routes_monitor_and_ring_separately(
     if expected_mid == "23022":
         video.async_start_monitor_talk.assert_awaited_once()
         assert not messages
-    elif expected_mid == "24000":
-        assert messages[0]["HEADER"]["MID"] == "24000"
-        assert messages[0]["HEADER"]["CID"] == "old-ring"
+    elif expected_mid == "24002":
+        video.async_answer_ring.assert_awaited_once_with("old-ring")
+        assert not messages
         video.async_start_monitor_talk.assert_not_called()
     else:
         assert not messages

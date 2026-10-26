@@ -75,12 +75,20 @@ class LiveVideoRelay:
         self.viewers_changed.set()
         return track
 
-    async def hold_monitor(self, duration: float) -> None:
+    async def hold_monitor(self, duration: float, reconnect_grace: float = 0) -> None:
         """Keep an explicitly opened monitor alive while anyone is watching."""
         await asyncio.sleep(duration)
-        while self.viewers:
+        while True:
+            while self.viewers:
+                self.viewers_changed.clear()
+                await self.viewers_changed.wait()
+            if not reconnect_grace:
+                return
             self.viewers_changed.clear()
-            await self.viewers_changed.wait()
+            try:
+                await asyncio.wait_for(self.viewers_changed.wait(), reconnect_grace)
+            except TimeoutError:
+                return
 
     def end(self) -> None:
         self.ready.clear()
@@ -97,18 +105,24 @@ class _Session:
     tracks: list[MediaStreamTrack] = field(default_factory=list)
     remote_ready: bool = False
     candidates: list[Any] = field(default_factory=list)
+    microphone: MediaStreamTrack | None = None
+    talking: bool = False
 
 
 class BrowserVideo:
-    """A receive-only camera bridge: no microphone, cloud signaling or credentials."""
+    """Share downlink media and optionally bind an explicitly offered microphone."""
 
     def __init__(
         self,
         get_track: Callable[[], Awaitable[MediaStreamTrack]],
         get_audio_track: Callable[[], MediaStreamTrack | None] | None = None,
+        start_talk: Callable[[MediaStreamTrack, str], Awaitable[None]] | None = None,
+        stop_talk: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         self._get_track = get_track
         self._get_audio_track = get_audio_track
+        self._start_talk = start_talk
+        self._stop_talk = stop_talk
         self._sessions: dict[str, _Session] = {}
 
     async def offer(self, sdp: str, session_id: str, answer: Callable[[str], None]) -> None:
@@ -120,6 +134,15 @@ class BrowserVideo:
         async def connection_changed():
             if session.pc.connectionState in ("failed", "closed"):
                 await self.close(session_id)
+
+        @session.pc.on("track")
+        def microphone(track):
+            if track.kind == "audio":
+                session.microphone = track
+
+                @track.on("ended")
+                def mic_ended():
+                    asyncio.create_task(self.close(session_id))
 
         session.setup = asyncio.create_task(self._answer(session_id, session, sdp, answer))
         try:
@@ -150,18 +173,21 @@ class BrowserVideo:
             asyncio.create_task(self.close(session_id))
 
         pc.addTrack(track)
+        if session.microphone and self._start_talk:
+            await self._start_talk(session.microphone, session_id)
+            session.talking = True
         for transceiver in transceivers:
             if transceiver.kind == "video":
                 transceiver.direction = "sendonly"
             elif transceiver.kind == "audio":
                 audio = self._get_audio_track() if self._get_audio_track else None
+                microphone = bool(session.microphone and self._start_talk)
                 if audio is None:
-                    transceiver.direction = "inactive"
+                    transceiver.direction = "recvonly" if microphone else "inactive"
                 else:
                     session.tracks.append(audio)
                     pc.addTrack(audio)
-                    # Even an offer with a microphone gets output audio only.
-                    transceiver.direction = "sendonly"
+                    transceiver.direction = "sendrecv" if microphone else "sendonly"
         await pc.setLocalDescription(await pc.createAnswer())
         if self._sessions.get(session_id) is session:
             answer(pc.localDescription.sdp)
@@ -193,7 +219,11 @@ class BrowserVideo:
             await asyncio.gather(session.setup, return_exceptions=True)
         for track in session.tracks:
             track.stop()
+        if session.microphone:
+            session.microphone.stop()
         await session.pc.close()
+        if session.talking and self._stop_talk:
+            await self._stop_talk(session_id)
 
     async def aclose(self) -> None:
         for session_id in tuple(self._sessions):

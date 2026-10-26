@@ -24,6 +24,7 @@ async def async_setup_entry(
     async_add_entities([
         AiphoneMonitorButton(coord),
         AiphoneAnswerButton(coord),
+        AiphoneHangUpButton(coord),
         AiphoneReplyButton(coord),
         AiphoneStopReplyButton(coord),
     ])
@@ -131,3 +132,19 @@ class AiphoneStopReplyButton(_ReplyButtonBase):
 
     async def async_press(self) -> None:
         await self._coord.reply.stop()
+
+
+class AiphoneHangUpButton(ButtonEntity):
+    """End Monitor or an answered call using the app's disconnect sequence."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Hang up"
+    _attr_icon = "mdi:phone-hangup"
+
+    def __init__(self, coordinator: AiphoneCoordinator) -> None:
+        self._coord = coordinator
+        self._attr_unique_id = f"{coordinator.device_id}_hang_up"
+        self._attr_device_info = _device_info(coordinator)
+
+    async def async_press(self) -> None:
+        await self._coord.async_hang_up()

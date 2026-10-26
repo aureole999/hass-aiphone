@@ -66,6 +66,7 @@ async def test_ha_diagnostics_never_includes_config_entry_credentials():
     coord = SimpleNamespace(
         mqtt_connected=True, doorbell_state="idle", signal_trace=SignalTrace("client"),
         video=SimpleNamespace(_mon_pc1=None, _mon_pc2=None, _passive_pc=None,
+                              _accepted=False, _talk_owner=None, _uplink=None, _ring_publisher=None,
                               live=SimpleNamespace(viewers=[])),
     )
     hass = SimpleNamespace(data={"aiphone": {"entry": coord}})

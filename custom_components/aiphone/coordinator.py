@@ -66,6 +66,7 @@ class AiphoneCoordinator:
         self.last_caller: str = ""
         self.last_event: dict[str, Any] = {}
         self._active_cid: str | None = None
+        self.call_kind = 1
 
         self._client: mqtt.Client | None = None
         self._cert_path: Path | None = None
@@ -134,8 +135,13 @@ class AiphoneCoordinator:
 
     def _on_disconnect(self, client, userdata, rc):
         _LOGGER.warning("AWS IoT disconnected rc=%s — paho will reconnect", rc)
-        self.hass.loop.call_soon_threadsafe(self.reply.cancel)
-        self.hass.loop.call_soon_threadsafe(self.notify_reply_state)
+        self.hass.loop.call_soon_threadsafe(self._connection_lost)
+
+    @callback
+    def _connection_lost(self):
+        self.reply.cancel()
+        self.hass.async_create_task(self.video.async_hang_up(remote=True))
+        self.notify_reply_state()
 
     def _on_message(self, client, userdata, msg):
         try:
@@ -192,24 +198,26 @@ class AiphoneCoordinator:
         """
         if self.doorbell_state != STATE_RINGING and self.video._mon_cid:
             return await self.video.async_start_monitor_talk()
-        cid = self._active_cid if self.doorbell_state == STATE_RINGING else None
+        cid = self._active_cid if self.doorbell_state in (STATE_RINGING, STATE_ANSWERED) else None
         if not cid:
             _LOGGER.warning("answer_call: no active call/monitor to answer")
             return False
-        sent = self.publish({
-            "HEADER": {
-                "MID": "24000", "VER": "1.0", "SYS": "2",
-                "CLIID": self.cliid,
-                "CKIND": 1, "RECKIND": 0, "AVID": 0,
-                "CID": cid,
-                "RSLT": 200, "REASON": 0, "LEN": 0,
-                "SID": now_sid(),
-                "SNDTPC": self.sndtpc, "RCVTPC": self.rcvtpc,
-            },
-            "BODY": {},
-        })
-        _LOGGER.info("📞 24000 RSLT=200 answer sent for cid=...%s", cid[-30:])
-        return sent
+        return await self.video.async_answer_ring(cid)
+
+    def call_answered(self) -> None:
+        self._cancel_timer()
+        self._set_doorbell(STATE_ANSWERED)
+
+    def call_ended(self, cid: str | None = None) -> None:
+        if cid and self._active_cid and cid != self._active_cid:
+            return
+        self._active_cid = None
+        self._cancel_timer()
+        self._set_doorbell(STATE_IDLE)
+
+    async def async_hang_up(self) -> None:
+        await self.reply.stop()
+        await self.video.async_hang_up()
 
     def async_unlock_door(self) -> None:
         """Send MID 26021 SET_UNLOCK_REQ. Unit auto-relocks after a few seconds."""
@@ -238,38 +246,45 @@ class AiphoneCoordinator:
         mid = str(head.get("MID", ""))
         cid = head.get("CID")
 
-        if mid == "23001":
+        # Resolve session-bound waiters before changing state. A response for
+        # another CID can never complete an acceptance or release request.
+        self.video.on_signal(mid, raw)
+        self.reply.on_signal(mid, raw)
+        if mid == "23001" and cid:
+            if cid == self._active_cid:  # MQTT QoS1 redelivery
+                return
             self.last_caller = flat.get("DSP1") or "?"
             self.last_event = {
                 "ts": datetime.now(timezone.utc).isoformat(),
-                "dsp1": flat.get("DSP1"),
-                "dsp2": flat.get("DSP2"),
-                "cid": cid,
-                "ckind": flat.get("CKIND"),
-                "tmkind": flat.get("TMKIND"),
-                "tmid": flat.get("TMID"),
+                "dsp1": flat.get("DSP1"), "dsp2": flat.get("DSP2"),
+                "cid": cid, "ckind": flat.get("CKIND"),
+                "tmkind": flat.get("TMKIND"), "tmid": flat.get("TMID"),
             }
+            self.call_kind = flat.get("CKIND", 1)
+            self._active_cid = cid
             self._set_doorbell(STATE_RINGING)
             self._arm_timer()
-            if cid:
-                self._active_cid = cid
-                self.hass.async_create_task(
-                    self.video.passive_capture(cid, flat.get("DSP1") or "ring")
-                )
-        elif mid == "24000" and head.get("RSLT") == 200:
-            self._set_doorbell(STATE_ANSWERED)
-            self._arm_timer()
-        elif mid == "24002":
-            self._set_doorbell(STATE_IDLE)
-            self._cancel_timer()
-            if cid and cid == self._active_cid:
-                self._active_cid = None
-                self.hass.async_create_task(self.video.passive_finalize())
+            # 24000 acknowledges receipt; it does not accept the visitor.
+            self.video._send("24000", cid, CKIND=self.call_kind, RSLT=200,
+                             TMKIND=flat.get("TMKIND", 5), TMID=flat.get("TMID", 1281))
+            self.hass.async_create_task(self._incoming_video(cid, self.last_caller))
+        elif cid and cid == self.video.session_cid:
+            if mid in ("23003", "23004") and head.get("CLIID") != self.cliid:
+                self.video._send("24003" if mid == "23003" else "24004", cid,
+                                 CKIND=self.call_kind, RSLT=200, REASON=head.get("REASON", 16))
+                self.hass.async_create_task(self.video.async_hang_up(remote=True))
+            elif mid == "24002" and str(head.get("RSLT")) == "200":
+                # An official app/indoor station took the call. Never hang up
+                # their conversation when releasing our own media subscription.
+                sender = head.get("CLIID")
+                if sender and sender != self.cliid:
+                    self.hass.async_create_task(self.video.async_hang_up(remote=True))
 
-        # Forward signaling MIDs to the video capture state machines
-        if mid in ("31001", "24021", "31011", "31012", "24022"):
-            self.video.on_signal(mid, raw)
-        self.reply.on_signal(mid, raw)
+    async def _incoming_video(self, cid: str, caller: str) -> None:
+        if self.video._lock.locked():
+            await self.video.async_hang_up(remote=True)
+        if self._active_cid == cid:
+            await self.video.passive_capture(cid, caller)
 
     def _set_doorbell(self, new_state: str) -> None:
         if new_state == self.doorbell_state:
@@ -292,7 +307,8 @@ class AiphoneCoordinator:
         self._timer_handle = None
         if self.doorbell_state == STATE_RINGING:
             _LOGGER.info("doorbell timeout → idle")
-            self._set_doorbell(STATE_IDLE)
+            self.hass.async_create_task(self.video.async_hang_up(remote=True))
+            self.call_ended()
 
     # -------------------------------------------------------------------
     # device info (used by entity DeviceInfo)

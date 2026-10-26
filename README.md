@@ -1,41 +1,20 @@
-# Aiphone WP-2MED — experimental prerecorded replies
+# Aiphone WP-2MED — Monitor and two-way calls
 
-Fork maintained at **https://github.com/aureole999/hass-aiphone**. [中文安装与测试说明](README.zh-CN.md).
+Fork maintained by [aureole999](https://github.com/aureole999/hass-aiphone), based on [yufeikang/hass-aiphone](https://github.com/yufeikang/hass-aiphone).
+[完整中文安装和操作说明](README.zh-CN.md).
 
-This fork adds a manual **Play prerecorded reply (experimental)** button for an
-existing incoming ring, a local audio-file option, a stop-sender button and a
-reply-status sensor. It retains the upstream integration domain and existing
-entity IDs. Developing and publishing this fork does not pair with a device.
-The new reply feature runs only on a manual button press; upstream automatic
-ring-triggered video recording remains in place after installation and pairing.
+v0.2.0b7 implements Monitor-to-talk, incoming-call answer, browser microphone uplink, downlink audio/video, mute, hangup and prerecorded replies using the official Type A app's protocol. Existing pairing and entity unique IDs are retained. Real local WebRTC tests pass; physical WP-2MED speaker playback and cloud interoperability still require device testing.
 
-**Hardware status: unverified on a real WP-2MED.** The audio publisher is tested
-against another local aiortc endpoint, not Aiphone's cloud. The incoming-call
-publisher signaling sequence and audio routing to the entrance speaker still
-need device testing. `sent` means local sending completed, not audible playback.
-Remote hangup remains unimplemented; closing the sender does not promise to end
-the call on the unit. This fork does not yet provide RTSP or go2rtc integration.
+Install this repository through HACS (Integration category), select the prerelease and restart HA. Register `/aiphone-static/aiphone-intercom-card.js?v=0.2.0b7` as a JavaScript Module dashboard resource, then add:
 
-The experimental code is included in **`master`**. Add this fork as a HACS
-custom repository (Integration category), or download the
-[master ZIP](https://github.com/aureole999/hass-aiphone/archive/refs/heads/master.zip)
-and copy its `custom_components/aiphone` directory. Restart Home Assistant
-after installation. Put a recording in
-`/config/aiphone/replies/reply.wav`; select its basename in the integration
-options. Press the reply button only during an incoming ring. Local audio is
-limited to 30 seconds / 10 MiB and is never automatically played on a ring.
-The file is decoded and resampled completely before answering; the sender emits
-silence until negotiation and a matching acceptance event are observed.
+```yaml
+type: custom:aiphone-intercom-card
+entity: camera.aiphone_wp_2med_entrance
+```
 
-The code uses a `30001/31001` publisher based on the upstream monitor flow with
-the existing ring CID, then requests `24000 RSLT=200`. It cancels on call end,
-a new call, another client's acceptance, MQTT disconnection, stop or unload.
-No speculative door-release or cloud-hangup messages are added.
+Monitor only watches; Talk explicitly requests microphone permission and accepts the current ring or upgrades Monitor. Mute controls the local microphone. Hangup/closing a talking card stops capture and disconnects. HTTPS is required for browser microphone access. The native Entrance camera remains available for viewing; older HA camera players may not provide microphone controls. An Answer entity alone does not capture a microphone.
 
-See [README.zh-CN.md](README.zh-CN.md) for setup, limitations and local tests.
-The original project is [yufeikang/hass-aiphone](https://github.com/yufeikang/hass-aiphone).
-Its documentation follows below and describes **upstream** behavior; upstream
-production claims do not apply to the new experimental audio sender.
+Upstream pairing and device documentation follows; the current audio workflow is documented in the Chinese guide above. This project does not provide RTSP, go2rtc or HomeKit talkback output.
 
 ---
 
@@ -51,7 +30,7 @@ Native Home Assistant integration for **Aiphone WP-2MED** video intercoms (singl
 
 This integration talks directly to the unit's AWS IoT cloud over mTLS — the same channel the official iOS/Android app uses — and exposes doorbell events, live snapshots, on-demand monitor, recording, answer, and electric strike unlock as native HA entities. **No cloud relay, no scraping, no polling**: the integration receives push events from AWS IoT MQTT in real time.
 
-> **Status**: Phase 2 features are working in production for one user (the author). Phase 3 (answer / unlock) is implemented but partially untested. See [§ Status](#status) below.
+> **Status**: Video and ring events have been used on hardware. The new two-way call implementation is locally tested and awaits user verification on the doorbell.
 
 ---
 
@@ -76,7 +55,7 @@ This integration talks directly to the unit's AWS IoT cloud over mTLS — the sa
 | Entity | Action |
 |---|---|
 | `button.<unit>_monitor` | On-demand 30-second active monitor (camera-on, no ring, doesn't bother other paired clients) |
-| `button.<unit>_answer` | Send `MID 24000 RSLT=200` — accept the currently-ringing call. Opens audio, stops the unit ringing, suppresses other clients' notifications. |
+| `button.<unit>_answer` | Answer a ring with `30021/31021 → 24002/25001`, or upgrade Monitor with `23022/24022`. |
 
 ### Lock
 
@@ -168,19 +147,18 @@ If pairing fails, make sure:
 | Auto-record on ring | ✅ Working in production |
 | `camera.entrance` snapshots | ✅ Working — live frame + mp4 fallback |
 | `button.monitor` (on-demand camera) | ✅ Working — 30 s mp4 captured end-to-end |
-| `button.answer` (24000 RSLT=200) | ⚠️ **Implemented, untested with real ring** |
+| `button.answer` | App-compatible Monitor/ring signaling; device verification pending |
 | `lock.door` (26021 unlock) | ⚠️ Implemented, **physical effect not verifiable** by author (no electric strike wired) |
-| Audio in recordings | ❌ Not yet — cloud only opens RTP audio after a real-ring `24000`. Pending answer-button test. |
-| Hangup | ❌ Not implemented (likely `24002 RSLT=603` + `30031` release) |
-| Two-way audio (TTS / AI assistant talking back) | ❌ Not implemented — PC1 leaves an audio-sendrecv transceiver open as a placeholder for this. |
-| HACS distribution | ❌ Not yet (this README + `hacs.json` are the prep) |
+| Audio in recordings | Shared received audio is recorded when the device supplies packets |
+| Hangup | `30031/31031 → 23003/24003`, plus local media cleanup |
+| Browser two-way audio / prerecorded replies | Implemented; real local PCMU tests pass, physical speaker verification pending |
+| HACS distribution | Custom integration repository with prereleases |
 
 ---
 
 ## Known issues
 
 - **First snapshot lag**: ~3 seconds between doorbell ring and first JPEG frame, dominated by SDP exchange + DTLS handshake. The `camera` entity falls back to the previous mp4's last frame during this window.
-- **Hangup workaround**: the integration has no hangup button yet. After `button.answer`, the call ends naturally when the unit times out (or the visitor walks away). The recording stops 8 s after the unit broadcasts `MID 24002`.
 - **Multi-client subscriber slot**: the cloud admits only one subscriber per ring. If the official phone app subscribes first, HA's recording for that ring may show `RSLT=400` and produce no video. In practice this hasn't been an issue because we typically subscribe within ~100 ms of the ring.
 
 ---
