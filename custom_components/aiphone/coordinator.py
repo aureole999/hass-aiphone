@@ -4,7 +4,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 import ssl
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,7 +30,6 @@ from .const import (
     REPLY_AUDIO_SUBDIR,
     DEFAULT_IOT_HOST,
     DEFAULT_IOT_PORT,
-    DOMAIN,
     MONITOR_DEFAULT_DURATION_S,
     RING_TIMEOUT_S,
     SIGNAL_STATE_UPDATE,
@@ -41,6 +39,7 @@ from .const import (
 )
 from .media import VideoCapture, now_sid
 from .reply import ReplyPublisher
+from .media_diagnostics import SignalTrace
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -72,6 +71,7 @@ class AiphoneCoordinator:
         self._cert_path: Path | None = None
         self._key_path: Path | None = None
         self._timer_handle: asyncio.TimerHandle | None = None
+        self.signal_trace = SignalTrace(self.cliid)
 
         self.video = VideoCapture(self)
         self.reply = ReplyPublisher(self)
@@ -154,6 +154,7 @@ class AiphoneCoordinator:
             return False
         payload = json.dumps(msg, separators=(",", ":")) + "\n"
         result = self._client.publish(self.sndtpc, payload, qos=1)
+        self.signal_trace.add("tx", msg)
         return result.rc == mqtt.MQTT_ERR_SUCCESS
 
     @property
@@ -231,6 +232,7 @@ class AiphoneCoordinator:
     # -------------------------------------------------------------------
     @callback
     def _dispatch(self, raw: dict[str, Any]) -> None:
+        self.signal_trace.add("rx", raw)
         head = raw.get("HEADER", {}) or {}
         body = raw.get("BODY", {}) or {}
         flat = {**head, **body}
