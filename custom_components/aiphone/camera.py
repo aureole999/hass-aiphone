@@ -47,7 +47,9 @@ class AiphoneEntranceCamera(Camera):
     _attr_has_entity_name = True
     _attr_name = "Entrance"
     _attr_icon = "mdi:doorbell-video"
-    _attr_supported_features = CameraEntityFeature.STREAM
+    _attr_supported_features = CameraEntityFeature.STREAM | getattr(
+        CameraEntityFeature, "TWO_WAY_AUDIO", 0
+    )
 
     def __init__(self, coordinator: AiphoneCoordinator) -> None:
         super().__init__()
@@ -63,7 +65,9 @@ class AiphoneEntranceCamera(Camera):
         self._cached_path: Path | None = None
         self._cached_jpeg: bytes | None = None
         self._browser_video = BrowserVideo(
-            coordinator.video.async_viewer_track, coordinator.video.viewer_audio_track
+            coordinator.video.async_viewer_track, coordinator.video.viewer_audio_track,
+            getattr(coordinator.video, "async_microphone", None),
+            getattr(coordinator.video, "async_microphone_closed", None),
         )
 
     async def async_added_to_hass(self) -> None:
@@ -77,7 +81,7 @@ class AiphoneEntranceCamera(Camera):
     async def async_handle_async_webrtc_offer(
         self, offer_sdp: str, session_id: str, send_message: WebRTCSendMessage
     ) -> None:
-        """Play incoming audio/video without accepting calls or publishing audio."""
+        """Receive-only offers monitor; an offered microphone explicitly starts talk."""
         try:
             await self._browser_video.offer(
                 offer_sdp, session_id, lambda sdp: send_message(WebRTCAnswer(sdp))
@@ -86,7 +90,7 @@ class AiphoneEntranceCamera(Camera):
             _LOGGER.exception("Unable to start Entrance live video")
             send_message(WebRTCError(
                 "aiphone_video_failed",
-                "Unable to start Aiphone video. Check the integration logs and connection.",
+                "Unable to start Aiphone audio/video. Check the integration logs and connection.",
             ))
 
     async def async_on_webrtc_candidate(self, session_id, candidate) -> None:

@@ -39,6 +39,14 @@ PLATFORMS: list[Platform] = [
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Aiphone from a config entry."""
+    from homeassistant.components.http import StaticPathConfig
+
+    # Once per HA lifetime, including integration reloads/multiple entries.
+    if "aiphone_frontend" not in hass.data:
+        await hass.http.async_register_static_paths([
+            StaticPathConfig("/aiphone-static", str(Path(__file__).parent / "frontend"), False)
+        ])
+        hass.data["aiphone_frontend"] = True
     coordinator = AiphoneCoordinator(hass, entry)
     try:
         await coordinator.async_start()

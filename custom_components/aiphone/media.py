@@ -1,11 +1,12 @@
 """WebRTC media capture for Aiphone — passive (doorbell ring) + active (monitor).
 
 Two-PC architecture for active monitor (per CallManager.getMonitorRequests):
-  PC #1 publisher placeholder  — claims our slot in the Janus VideoRoom
+  PC #1 gated PCMU publisher — sends microphone/file audio after acceptance
   PC #2 subscriber to WP-2MED  — actually receives the camera feed
 
 Passive doorbell flow uses just one PC as subscriber (mirrors the official
-phone app's behavior when receiving an incoming ring).
+phone app's behavior when receiving an incoming ring). Answering adds a
+30021 publisher, then sends 24002 and waits for 25001.
 
 Both flows: we munge Janus's `setup:actpass` SDP offer to `setup:active` so
 aiortc, as RFC-compliant answerer, MUST become passive (DTLS server). This
@@ -43,12 +44,17 @@ from .const import (
     SIGNAL_CAMERA_REFRESH,
 )
 from .live import LiveVideoRelay
+from .audio import UplinkAudioTrack, prefer_pcmu
 
 if TYPE_CHECKING:
     from .coordinator import AiphoneCoordinator
 
 _LOGGER = logging.getLogger(__name__)
-MONITOR_TALK_TIMEOUT_S = 8
+MONITOR_TALK_TIMEOUT_S = 13
+
+
+class SignalingRejected(RuntimeError):
+    """An explicit cloud/device rejection, rather than an ambiguous timeout."""
 
 
 def now_sid() -> str:
@@ -82,7 +88,7 @@ def _log_audio_section(tag: str, sdp: str) -> None:
                                        "a=sendonly", "a=recvonly", "a=inactive",
                                        "a=mid:", "c=")):
             lines.append(ln)
-    _LOGGER.info("%s audio block:\n  %s", tag, "\n  ".join(lines) if lines else "(none)")
+    _LOGGER.debug("%s audio block:\n  %s", tag, "\n  ".join(lines) if lines else "(none)")
 
 
 class _PassthroughVideoTrack(MediaStreamTrack):
@@ -139,7 +145,7 @@ async def _periodic_stats_logger(
 ) -> None:
     """[Phase 1 diagnostic] Log RTP stats every N sec for the call duration so we
     can see exactly *when* audio packets first start flowing — critical for
-    validating the 24000 → cloud-opens-audio hypothesis."""
+    validating the call acceptance and audio arrival."""
     try:
         end = time.time() + duration_s
         while time.time() < end:
@@ -152,7 +158,7 @@ async def _periodic_stats_logger(
                 if getattr(stat, "type", "") == "inbound-rtp":
                     pkts = getattr(stat, "packetsReceived", 0) or 0
                     if pkts > 0:
-                        _LOGGER.info(
+                        _LOGGER.debug(
                             "📊 %s [+%.0fs] inbound-rtp kind=%s codec=%s pkts=%s bytes=%s",
                             tag,
                             period_s,
@@ -198,6 +204,16 @@ class VideoCapture:
         self._mon_fut_24022: asyncio.Future | None = None
         self._monitor_talking = False
         self._monitor_talk_lock = asyncio.Lock()
+        self._ring_publisher = None
+        self._uplink: UplinkAudioTrack | None = None
+        self._signals: dict[str, asyncio.Future] = {}
+        self._passive_ready = asyncio.Event()
+        self._talk_lock = asyncio.Lock()
+        self._accepted = False
+        self._answer_requested = False
+        self._remote_ended = False
+        self._released: set[str] = set()
+        self._talk_owner: str | None = None
 
     @property
     def recordings_dir(self) -> Path:
@@ -250,11 +266,15 @@ class VideoCapture:
                     result = await asyncio.wait_for(future, MONITOR_TALK_TIMEOUT_S)
                 except TimeoutError as err:
                     raise RuntimeError("No response to the monitor phone-button request") from err
-                if result != 200:
+                if str(result) != "200":
                     raise RuntimeError(f"Monitor talk was rejected (24022 RSLT={result})")
                 if self._mon_cid != cid:
                     raise RuntimeError("The monitor session ended before talk was enabled")
                 self._monitor_talking = True
+                self._accepted = True
+                if self._uplink:
+                    self._uplink.enabled = True
+                self.coord.call_answered()
                 _LOGGER.info("Monitor phone-button request accepted (24022 RSLT=200)")
                 return True
             finally:
@@ -262,6 +282,170 @@ class VideoCapture:
                     future.cancel()
                 if self._mon_fut_24022 is future:
                     self._mon_fut_24022 = None
+
+    def _watch_peer(self, pc: RTCPeerConnection) -> None:
+        @pc.on("connectionstatechange")
+        async def connection_changed():
+            task = self._capture_task
+            if pc.connectionState == "failed" and task and not task.cancelling():
+                _LOGGER.warning("Doorbell media connection failed; closing call")
+                await self.async_hang_up()
+
+    @property
+    def session_cid(self) -> str | None:
+        return self._mon_cid or self._passive_cid
+
+    def _send(self, mid: str, cid: str, body=None, **fields) -> None:
+        body = body or {}
+        header = {
+            "MID": mid, "VER": "1.0", "SYS": "2", "CLIID": self.coord.cliid,
+            "PCLIID": self.coord.sndtpc.rsplit("/", 1)[-1],
+            "RCVTPC": self.coord.rcvtpc, "SNDTPC": self.coord.sndtpc,
+            "SID": now_sid(), "CID": cid, "RSLT": 0,
+            "LEN": len(body.get("SDP", "")), **fields,
+        }
+        if not self.coord.publish({"HEADER": header, "BODY": body}):
+            raise RuntimeError("Aiphone cloud messaging is not connected")
+
+    async def _request(self, mid, reply, cid, body=None, timeout=13, **fields):
+        future = asyncio.get_running_loop().create_future()
+        if reply in self._signals:
+            raise RuntimeError("A signaling request is already pending")
+        self._signals[reply] = future
+        try:
+            self._send(mid, cid, body, **fields)
+            result = await asyncio.wait_for(future, timeout)
+            code = str((result.get("HEADER") or {}).get("RSLT", 0))
+            if code not in ("0", "200"):
+                raise SignalingRejected(f"Aiphone rejected {mid} (RSLT={code})")
+            return result
+        except TimeoutError as err:
+            raise RuntimeError(f"Timed out waiting for Aiphone {reply}") from err
+        finally:
+            self._signals.pop(reply, None)
+            if not future.done():
+                future.cancel()
+
+    async def _start_ring_publisher(self, cid: str) -> None:
+        pc = self._ring_publisher = RTCPeerConnection(RTCConfiguration(iceServers=[]))
+        self._watch_peer(pc)
+        self._uplink = UplinkAudioTrack()
+        sender = pc.addTrack(self._uplink)
+        transceiver = next(t for t in pc.getTransceivers() if t.sender is sender)
+        prefer_pcmu(transceiver)
+        await pc.setLocalDescription(await pc.createOffer())
+        result = await self._request("30021", "31021", cid,
+                                     {"SDP": _strip_extra_fp(pc.localDescription.sdp)}, RLS="0")
+        sdp = (result.get("BODY") or {}).get("SDP")
+        if not sdp:
+            raise RuntimeError("31021 did not contain an audio publisher SDP")
+        await pc.setRemoteDescription(RTCSessionDescription(sdp, "answer"))
+        if transceiver.currentDirection not in ("sendonly", "sendrecv"):
+            raise RuntimeError("The doorbell did not negotiate audio transmission")
+        # Complete ICE/DTLS before accepting, as in the app's relay queue.
+        async with asyncio.timeout(15):
+            while pc.connectionState not in ("connected", "failed", "closed"):
+                await asyncio.sleep(.05)
+        if pc.connectionState != "connected":
+            raise RuntimeError("The doorbell audio publisher could not connect")
+
+    async def async_answer_ring(self, cid: str) -> bool:
+        async with self._talk_lock:
+            if self._accepted and self._passive_cid == cid:
+                return True
+            await asyncio.wait_for(self._passive_ready.wait(), 30)
+            if self._passive_cid != cid or self.coord.active_call_id != cid:
+                raise RuntimeError("The ringing call has ended")
+            try:
+                if self._ring_publisher is None:
+                    await self._start_ring_publisher(cid)
+                self._answer_requested = True
+                await self._request("24002", "25001", cid, CKIND=self.coord.call_kind,
+                                    RECKIND=0, AVID=0, RSLT=200, REASON=0)
+                if self._passive_cid != cid or self.coord.active_call_id != cid:
+                    raise RuntimeError("The ringing call ended while answering")
+                self._accepted = True
+                self._uplink.enabled = True
+                self.coord.call_answered()
+                return True
+            except BaseException as err:
+                if isinstance(err, SignalingRejected):
+                    self._answer_requested = False
+                if self._uplink:
+                    self._uplink.stop()
+                if self._ring_publisher:
+                    await self._ring_publisher.close()
+                self._ring_publisher = self._uplink = None
+                raise
+
+    async def async_microphone(self, source, owner: str) -> None:
+        if self.coord.reply.busy:
+            raise RuntimeError("A prerecorded reply is already active")
+        if self._talk_owner and self._talk_owner != owner:
+            raise RuntimeError("Another microphone is already active")
+        self._talk_owner = owner
+        try:
+            if not await self.coord.async_answer_call():
+                raise RuntimeError("No active call or Monitor is available")
+            if self._uplink is None:
+                raise RuntimeError("The audio publisher is unavailable")
+            self._uplink.claim(owner, source)
+        except BaseException:
+            if self._talk_owner == owner:
+                self._talk_owner = None
+                await self.async_hang_up()
+            raise
+
+    async def async_microphone_closed(self, owner: str) -> None:
+        if self._talk_owner != owner:
+            return
+        if self._uplink:
+            self._uplink.release(owner)
+        self._talk_owner = None
+        # Closing the talking client ends its call; other viewers cannot
+        # silently keep an active microphone or a cloud call alive.
+        await self.async_hang_up()
+
+    async def _release_cloud(self, cid: str, hangup: bool) -> None:
+        if cid in self._released:
+            return
+        if len(self._released) >= 128:
+            self._released.clear()
+        self._released.add(cid)
+        if not self.coord.mqtt_connected:
+            return
+        try:
+            await self._request("30031", "31031", cid, timeout=2, RLS="0")
+        except RuntimeError:
+            _LOGGER.debug("Cloud relay leave was not acknowledged")
+        if hangup:
+            try:
+                await self._request("23003", "24003", cid, timeout=3,
+                                    CKIND=0 if self._mon_cid else self.coord.call_kind,
+                                    REASON=16, RECKIND=0, AVID=0)
+            except RuntimeError:
+                _LOGGER.warning("Doorbell hangup was not acknowledged; local media closed")
+
+    async def async_hang_up(self, remote: bool = False) -> None:
+        cid = self.session_cid
+        self._remote_ended = self._remote_ended or remote
+        if (not self._remote_ended and self._passive_cid and not self._accepted
+                and not self._answer_requested and self.coord.mqtt_connected):
+            # The app declines an unanswered ring with REPLY=603; it does not
+            # send a disconnect for a conversation it never accepted.
+            self._send("24002", self._passive_cid, CKIND=self.coord.call_kind, RSLT=603)
+        if self._uplink:
+            self._uplink.enabled = False
+        for mid, future in tuple(self._signals.items()):
+            if mid not in ("31031", "24003") and not future.done():
+                future.set_exception(RuntimeError("The call session ended"))
+        task = self._capture_task
+        if task and task is not asyncio.current_task():
+            if not task.cancelling():
+                task.cancel()
+            await asyncio.shield(asyncio.gather(task, return_exceptions=True))
+        if cid or not remote:
+            self.coord.call_ended(cid)
 
     @property
     def latest_recording(self) -> Path | None:
@@ -278,6 +462,11 @@ class VideoCapture:
         head = raw.get("HEADER", {}) or {}
         body = raw.get("BODY", {}) or {}
         cid = head.get("CID")
+
+        if cid is not None and cid == self.session_cid:
+            future = self._signals.get(mid)
+            if future and not future.done():
+                future.set_result(raw)
 
         # passive doorbell flow
         if cid is not None and cid == self._passive_cid:
@@ -306,6 +495,8 @@ class VideoCapture:
         await self._lock.acquire()
         self._capture_task = asyncio.current_task()
         self._passive_ended.clear()
+        self._passive_ready.clear()
+        self._accepted = self._answer_requested = self._remote_ended = False
         self.live.end()
         self._latest_video_frame = None
         try:
@@ -330,7 +521,7 @@ class VideoCapture:
         _LOGGER.info("🎥 passive capture cid=%s dsp1=%s -> %s", cid[-30:], dsp1, self._passive_path)
 
         pc = RTCPeerConnection(RTCConfiguration(iceServers=[]))
-        pc.addTransceiver("audio", direction="sendrecv")
+        pc.addTransceiver("audio", direction="recvonly")
         pc.addTransceiver("video", direction="recvonly")
         rec = MediaRecorder(str(self._passive_path))
         @pc.on("track")
@@ -356,13 +547,14 @@ class VideoCapture:
             )
             if track.kind == "audio":
                 # Distinguish: track event fired but RTP may not flow until
-                # cloud opens audio path (after 24000). Watch for periodic
+                # cloud opens audio path (after call acceptance). Watch for periodic
                 # stats below to confirm packets actually arrive.
                 _LOGGER.info("🎤 AUDIO TRACK ATTACHED — recorder will receive frames if RTP flows")
             if track.kind == "video":
                 rec.addTrack(self.live.attach(_PassthroughVideoTrack(track, self)))
             else:
                 rec.addTrack(self.live.attach(track))
+        self._watch_peer(pc)
         self._passive_pc = pc
         self._passive_recorder = rec
 
@@ -412,29 +604,32 @@ class VideoCapture:
         }, "BODY": {"SDP": answer_sdp}}
         self.coord.publish(msg2)
 
+        self._send("24001", cid, CKIND=self.coord.call_kind, RSLT=200)
+        self._passive_ready.set()
         await rec.start()
-        _LOGGER.info("🎬 passive recorder started — will stop %ss after 24002",
+        _LOGGER.info("🎬 passive recorder started — will stop %ss after disconnect",
                      PASSIVE_HOLD_AFTER_END_S)
 
         # [Phase 1] periodic RTP stats so we can see when audio actually starts
-        # flowing relative to the 24000 send. The task is killed at teardown.
+        # flowing relative to call acceptance. The task is killed at teardown.
         stats_task = asyncio.create_task(
             _periodic_stats_logger(pc, "passive", period_s=3.0, duration_s=120.0)
         )
 
-        # Hold; coordinator's 24002 handler will call stop()
+        # Hold; coordinator's disconnect handler will call stop()
         try:
-            # Cap at RING_TIMEOUT_S * 2 in case 24002 never arrives
-            await asyncio.wait_for(self._passive_ended.wait(), timeout=120)
+            # Cap the local call duration even if a disconnect notification is lost
+            await asyncio.wait_for(self._passive_ended.wait(), timeout=300)
         except TimeoutError:
             pass
         except asyncio.CancelledError:
-            pass
+            raise
         finally:
             stats_task.cancel()
+            await asyncio.gather(stats_task, return_exceptions=True)
 
     async def passive_finalize(self, delay_s: int = PASSIVE_HOLD_AFTER_END_S) -> None:
-        """Called from coordinator on 24002 — wait briefly then stop."""
+        """Wait briefly for recording flush, then stop the passive subscriber."""
         pc = self._passive_pc
         if pc is None:
             return
@@ -445,11 +640,24 @@ class VideoCapture:
 
     async def _passive_teardown(self) -> None:
         rec, pc, path = self._passive_recorder, self._passive_pc, self._passive_path
+        cid = self._passive_cid
+        if self._passive_cid:
+            await self._release_cloud(self._passive_cid, (self._accepted or self._answer_requested) and not self._remote_ended)
+        if self._uplink:
+            self._uplink.stop()
+        if self._ring_publisher:
+            await self._ring_publisher.close()
+        self._ring_publisher = self._uplink = None
+        self._passive_ready.clear()
+        self._talk_owner = None
+        self._accepted = False
         self.live.end()
         self._latest_video_frame = None
         self._passive_pc = self._passive_recorder = None
         self._passive_path = self._passive_cid = None
         self._passive_offer_fut = None
+        if cid:
+            self.coord.call_ended(cid)
         if rec is not None:
             try:
                 await rec.stop()
@@ -489,10 +697,14 @@ class VideoCapture:
                 self._capture_task = None
 
     async def _monitor_run(self, duration_s: int) -> None:
-        # PC #1 — publisher placeholder
+        self._accepted = self._answer_requested = self._remote_ended = False
+        # PC #1 — a real, gated PCMU publisher, initially silent.
         pc1 = RTCPeerConnection(RTCConfiguration(iceServers=[]))
         self._mon_pc1 = pc1
-        pc1.addTransceiver("audio", direction="sendrecv")
+        self._watch_peer(pc1)
+        self._uplink = UplinkAudioTrack()
+        sender = pc1.addTrack(self._uplink)
+        prefer_pcmu(next(t for t in pc1.getTransceivers() if t.sender is sender))
         offer1 = await pc1.createOffer()
         await pc1.setLocalDescription(RTCSessionDescription(_strip_extra_fp(offer1.sdp), "offer"))
         end = time.time() + SDP_OFFER_GATHER_TIMEOUT_S
@@ -517,6 +729,7 @@ class VideoCapture:
                 rec.addTrack(self.live.attach(_PassthroughVideoTrack(track, self)))
             else:
                 rec.addTrack(self.live.attach(track))
+        self._watch_peer(pc2)
         self._mon_pc2 = pc2
         self._mon_recorder = rec
 
@@ -549,7 +762,7 @@ class VideoCapture:
             "RSLT": 0, "LEN": 0, "SID": now_sid(),
         }})
         rslt = await asyncio.wait_for(self._mon_fut_24021, timeout=8)
-        if rslt != 200:
+        if str(rslt) != "200":
             _LOGGER.error("24021 RSLT=%s — monitor rejected", rslt)
             return
 
@@ -585,7 +798,7 @@ class VideoCapture:
 
         await rec.start()
         _LOGGER.info("🎬 monitor recording, holding %ss", duration_s)
-        await self.live.hold_monitor(duration_s)
+        await self.live.hold_monitor(duration_s, reconnect_grace=20)
 
     async def aclose(self) -> None:
         """Coordinator shutdown — drop any in-flight capture cleanly."""
@@ -600,6 +813,14 @@ class VideoCapture:
 
     async def _monitor_teardown(self) -> None:
         rec, pc1, pc2, path = self._mon_recorder, self._mon_pc1, self._mon_pc2, self._mon_path
+        cid = self._mon_cid
+        if self._mon_cid:
+            await self._release_cloud(self._mon_cid, not self._remote_ended)
+        if self._uplink:
+            self._uplink.stop()
+        self._uplink = None
+        self._talk_owner = None
+        self._accepted = False
         self.live.end()
         self._latest_video_frame = None
         self._mon_pc1 = self._mon_pc2 = self._mon_recorder = None
@@ -610,6 +831,8 @@ class VideoCapture:
         if self._mon_fut_24022 and not self._mon_fut_24022.done():
             self._mon_fut_24022.set_exception(RuntimeError("The monitor session ended"))
         self._mon_fut_24022 = None
+        if cid:
+            self.coord.call_ended(cid)
         if rec is not None:
             try:
                 await rec.stop()

@@ -1,29 +1,20 @@
-"""Experimental prerecorded reply publisher for an existing ringing call.
-
-The 30001 publisher is based on the upstream monitor implementation. Its use
-with a real incoming-call CID is NOT hardware-verified. No guessed hangup or
-door-release commands are sent. Local WebRTC resources are always closed.
-"""
+"""Prerecorded replies through the same app-compatible incoming-call session."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
 from collections import deque
-from datetime import datetime
 from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
 import av
-from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
 from aiortc.mediastreams import MediaStreamError, MediaStreamTrack
 
 from .reply_files import MAX_REPLY_SECONDS, resolve_reply_file
 
 _LOGGER = logging.getLogger(__name__)
-SIGNAL_TIMEOUT = 10
-CONNECTION_TIMEOUT = 15
 
 
 class ReplyError(Exception):
@@ -150,8 +141,7 @@ class ReplyPublisher:
         self.last_error: str | None = None
         self._task: asyncio.Task | None = None
         self._cid: str | None = None
-        self._answer_sent = False
-        self._signals: dict[str, asyncio.Future] = {}
+        self._remote_stop = False
 
     @property
     def busy(self) -> bool:
@@ -173,24 +163,19 @@ class ReplyPublisher:
         head = raw.get("HEADER", {}) or {}
         cid = head.get("CID")
         if mid == "23001" and cid and cid != self._cid:
+            self._remote_stop = True
             self.cancel()
             return
         if cid != self._cid:
             return
-        if mid == "24002":
+        if mid in ("23003", "23004"):
+            self._remote_stop = True
             self.cancel()
-        elif mid == "24000" and str(head.get("RSLT")) == "200":
+        elif mid == "24002" and str(head.get("RSLT")) == "200":
             sender = head.get("CLIID")
             if sender and sender != self.coord.cliid:
+                self._remote_stop = True
                 self.cancel()
-            elif self._answer_sent:
-                future = self._signals.get("accepted")
-                if future and not future.done():
-                    future.set_result(raw)
-        elif mid == "31001":
-            future = self._signals.get(mid)
-            if future and not future.done():
-                future.set_result(raw)
 
     def cancel(self) -> None:
         if self._task and not self._task.done() and not self._task.cancelling():
@@ -208,9 +193,12 @@ class ReplyPublisher:
     async def play(self, directory: Path, filename: str) -> None:
         if self.busy:
             raise ReplyError("A prerecorded reply is already in progress.")
+        if self.coord.video._talk_owner is not None:
+            raise ReplyError("A microphone is already active")
         self._cid = self.coord.active_call_id
         self._require_ringing()
         self.last_error = None
+        self._remote_stop = False
         self._task = asyncio.create_task(self._run(directory, filename))
         self.coord.notify_reply_state()
         try:
@@ -235,32 +223,7 @@ class ReplyPublisher:
         finally:
             self._task = None
             self._cid = None
-            self._answer_sent = False
-            for future in self._signals.values():
-                if not future.done():
-                    future.cancel()
-            self._signals.clear()
             self.coord.notify_reply_state()
-
-    def _publish(self, mid: str, body: dict | None = None, **fields: Any) -> None:
-        if self.coord.active_call_id != self._cid:
-            raise ReplyError("The incoming call is no longer active.")
-        header = {
-            "MID": mid,
-            "VER": "1.0",
-            "SYS": "2",
-            "CLIID": self.coord.cliid,
-            "RCVTPC": self.coord.rcvtpc,
-            "RSLT": 0,
-            "SID": datetime.now().strftime("%Y%m%d%H%M%S%f"),
-            "CID": self._cid,
-            "LEN": len((body or {}).get("SDP", "")),
-            **fields,
-        }
-        if mid == "30001":
-            header["RLS"] = "0"
-        if not self.coord.publish({"HEADER": header, "BODY": body or {}}):
-            raise ReplyError("Aiphone cloud messaging is not connected.")
 
     async def _run(self, directory: Path, filename: str) -> None:
         self._status("preparing")
@@ -282,96 +245,39 @@ class ReplyPublisher:
         if player.audio is None:
             await asyncio.to_thread(_close_player, player)
             raise ReplyError("The selected file has no audio track.")
-        pc = None
         track = GatedAudioTrack(player.audio)
+        video = self.coord.video
         try:
             self._require_ringing()
-            pc = RTCPeerConnection(RTCConfiguration(iceServers=[]))
-            sender = pc.addTrack(track)
-            connected = asyncio.Event()
-            self._signals = {
-                key: asyncio.get_running_loop().create_future()
-                for key in ("31001", "accepted")
-            }
-
-            @pc.on("connectionstatechange")
-            def state_changed() -> None:
-                if pc.connectionState in ("connected", "failed", "closed"):
-                    connected.set()
-
             self._status("connecting")
-            await pc.setLocalDescription(await pc.createOffer())
-            sdp = "\r\n".join(
-                line
-                for line in pc.localDescription.sdp.split("\r\n")
-                if not line.startswith("a=fingerprint:")
-                or line.startswith("a=fingerprint:sha-256")
-            )
-            self._require_ringing()
-            self._publish("30001", {"SDP": sdp})
-            answer = await asyncio.wait_for(self._signals["31001"], SIGNAL_TIMEOUT)
-            answer_sdp = (answer.get("BODY") or {}).get("SDP")
-            if not answer_sdp:
-                raise ReplyError(
-                    "The cloud did not return an audio publisher SDP answer."
-                )
-            await pc.setRemoteDescription(RTCSessionDescription(answer_sdp, "answer"))
-            if not any(
-                t.sender is sender and t.currentDirection in ("sendonly", "sendrecv")
-                for t in pc.getTransceivers()
-            ):
-                raise ReplyError("The cloud did not negotiate an audio-send direction.")
-            await asyncio.wait_for(connected.wait(), CONNECTION_TIMEOUT)
-            if pc.connectionState != "connected":
-                raise ReplyError("The audio publisher connection failed.")
-            self._require_ringing()
-            self._answer_sent = True
-            self._publish(
-                "24000",
-                CKIND=1,
-                RECKIND=0,
-                AVID=0,
-                RSLT=200,
-                REASON=0,
-                SNDTPC=self.coord.sndtpc,
-            )
             self._status("accepting")
-            # Matching MQTT acceptance is a protocol observation, not proof of
-            # audible playback. Firmware that does not echo it will time out.
-            await asyncio.wait_for(self._signals["accepted"], SIGNAL_TIMEOUT)
+            await video.async_answer_ring(self._cid)
             if self.coord.active_call_id != self._cid:
-                raise ReplyError("The incoming call is no longer active.")
+                raise ReplyError("The incoming call has ended")
+            if video._uplink is None:
+                raise ReplyError("The audio publisher is unavailable")
+            video._uplink.claim("prerecorded-reply", track)
             track.begin()
             self._status("sending")
+            before = video._uplink.frames_sent
             await asyncio.wait_for(track.finished.wait(), MAX_REPLY_SECONDS + 2)
+            await asyncio.sleep(.15)
             if track.error or not track.file_samples:
-                raise ReplyError(track.error or "No audio frames were sent.")
-            await asyncio.sleep(0.3)  # allow the final audio packet to leave
-            report = await pc.getStats()
-            packets = sum(
-                getattr(stat, "packetsSent", 0)
-                for stat in report.values()
-                if stat.type == "outbound-rtp"
-            )
-            if not packets:
-                raise ReplyError("No outbound RTP packets were reported.")
-            _LOGGER.info(
-                "Reply sender completed: %.2fs audio; %s RTP packets (speaker unverified)",
-                track.file_samples / 48000,
-                packets,
-            )
+                raise ReplyError(track.error or "No audio frames were sent")
+            if video._uplink.frames_sent <= before:
+                raise ReplyError("No reply audio frames were transmitted")
+            _LOGGER.info("Prerecorded reply completed (speaker verification required)")
             self._status("sent")
-        except asyncio.TimeoutError as err:
-            raise ReplyError(
-                "Timed out waiting for call audio signaling or playback."
-            ) from err
+        except (TimeoutError, RuntimeError) as err:
+            raise ReplyError(str(err)) from err
         finally:
+            if video._uplink:
+                video._uplink.release("prerecorded-reply")
             track.stop()
-            try:
-                if pc:
-                    await pc.close()
-            finally:
-                await asyncio.to_thread(_close_player, player)
+            await asyncio.to_thread(_close_player, player)
+            # The app releases its sender and disconnects after a reply.
+            if video.session_cid == self._cid:
+                await video.async_hang_up(remote=self._remote_stop)
 
 
 def _close_player(player: PreparedAudio) -> None:

@@ -34,7 +34,7 @@ STATE_IDLE = "idle"
 STATE_RINGING = "ringing"
 STATE_ANSWERED = "answered"
 
-# How long after a 23001 (ring) before we auto-clear to idle (in case 24002 is missed)
+# How long after a 23001 (ring) before we auto-clear to idle (if the visitor never connects)
 RING_TIMEOUT_S = 45
 
 # Local pairing protocol
@@ -46,6 +46,6 @@ PAIRING_DISCOVERY_TIMEOUT = 15
 
 # Media capture
 RECORDINGS_SUBDIR = "aiphone/recordings"     # under /config/
-PASSIVE_HOLD_AFTER_END_S = 8                 # extra time after 24002 to flush mp4
+PASSIVE_HOLD_AFTER_END_S = 8                 # legacy local recording flush interval
 MONITOR_DEFAULT_DURATION_S = 30
 SDP_OFFER_GATHER_TIMEOUT_S = 4

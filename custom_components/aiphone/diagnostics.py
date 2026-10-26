@@ -14,6 +14,10 @@ async def async_get_config_entry_diagnostics(hass, entry) -> dict:
             "monitor_talk_accepted": getattr(video, "_monitor_talking", False),
             "monitor_publisher": await peer_snapshot(video._mon_pc1),
             "monitor_subscriber": await peer_snapshot(video._mon_pc2),
+            "call_accepted": video._accepted,
+            "microphone_active": video._talk_owner is not None,
+            "uplink_frames": video._uplink.frames_sent if video._uplink else 0,
+            "ring_publisher": await peer_snapshot(video._ring_publisher),
             "ring_subscriber": await peer_snapshot(video._passive_pc),
             "viewers": {kind: sum(t.kind == kind for t in video.live.viewers)
                         for kind in ("audio", "video")},
