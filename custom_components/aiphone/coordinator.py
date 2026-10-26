@@ -183,21 +183,20 @@ class AiphoneCoordinator:
         """
         self.hass.async_create_task(self.video.monitor_capture(duration_s))
 
-    def async_answer_call(self) -> bool:
-        """Send MID 24000 RSLT=200 to accept the currently ringing call.
+    async def async_answer_call(self) -> bool:
+        """Accept an incoming ring, or use the phone button for an active monitor.
 
-        Side effects (by design): the unit stops ringing, other paired
-        clients see the call as answered (no longer get a notification),
-        and the cloud opens the audio RTP path so subsequent recording
-        includes audio. No-op if there is no active call.
+        Ring acceptance stops ringing for other clients. Monitor uses the
+        observed 23022/24022 transition instead. Signaling acceptance alone
+        does not prove that audio RTP has arrived.
         """
-        # Fall back to the active monitor CID — useful for "wake the unit
-        # up and ask it to also open audio" flows.
-        cid = self._active_cid or getattr(self.video, "_mon_cid", None)
+        if self.doorbell_state != STATE_RINGING and self.video._mon_cid:
+            return await self.video.async_start_monitor_talk()
+        cid = self._active_cid if self.doorbell_state == STATE_RINGING else None
         if not cid:
             _LOGGER.warning("answer_call: no active call/monitor to answer")
             return False
-        self.publish({
+        sent = self.publish({
             "HEADER": {
                 "MID": "24000", "VER": "1.0", "SYS": "2",
                 "CLIID": self.cliid,
@@ -210,7 +209,7 @@ class AiphoneCoordinator:
             "BODY": {},
         })
         _LOGGER.info("📞 24000 RSLT=200 answer sent for cid=...%s", cid[-30:])
-        return True
+        return sent
 
     def async_unlock_door(self) -> None:
         """Send MID 26021 SET_UNLOCK_REQ. Unit auto-relocks after a few seconds."""
@@ -268,7 +267,7 @@ class AiphoneCoordinator:
                 self.hass.async_create_task(self.video.passive_finalize())
 
         # Forward signaling MIDs to the video capture state machines
-        if mid in ("31001", "24021", "31011", "31012"):
+        if mid in ("31001", "24021", "31011", "31012", "24022"):
             self.video.on_signal(mid, raw)
         self.reply.on_signal(mid, raw)
 

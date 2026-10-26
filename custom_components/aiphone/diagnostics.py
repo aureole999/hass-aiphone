@@ -11,6 +11,7 @@ async def async_get_config_entry_diagnostics(hass, entry) -> dict:
         "mqtt_connected": coord.mqtt_connected,
         "doorbell_state": coord.doorbell_state,
         "media": {
+            "monitor_talk_accepted": getattr(video, "_monitor_talking", False),
             "monitor_publisher": await peer_snapshot(video._mon_pc1),
             "monitor_subscriber": await peer_snapshot(video._mon_pc2),
             "ring_subscriber": await peer_snapshot(video._passive_pc),
