@@ -302,9 +302,9 @@ async def test_monitor_stays_open_until_last_viewer_leaves():
 
 
 @pytest.mark.asyncio
-async def test_multiple_camera_opens_start_one_monitor_and_unload_releases_lock(media_module):
+async def test_multiple_camera_opens_start_one_monitor_and_unload_releases_lock(media_module, tmp_path):
     coord = types.SimpleNamespace(
-        mqtt_connected=True, hass=types.SimpleNamespace(async_create_task=asyncio.create_task)
+        mqtt_connected=True, cliid="client", doorbell_state="idle", hass=types.SimpleNamespace(async_create_task=asyncio.create_task, config=types.SimpleNamespace(path=lambda sub: str(tmp_path / sub)))
     )
     video = media_module.VideoCapture(coord)
     source = TestPattern()
@@ -326,8 +326,8 @@ async def test_multiple_camera_opens_start_one_monitor_and_unload_releases_lock(
 
 
 @pytest.mark.asyncio
-async def test_call_end_releases_capture_lock_immediately_after_flush(media_module):
-    video = media_module.VideoCapture(types.SimpleNamespace())
+async def test_call_end_releases_capture_lock_immediately_after_flush(media_module, tmp_path):
+    video = media_module.VideoCapture(types.SimpleNamespace(cliid="client", hass=types.SimpleNamespace(config=types.SimpleNamespace(path=lambda sub: str(tmp_path / sub)))))
     ready = asyncio.Event()
 
     class Peer:
@@ -410,6 +410,7 @@ def monitor_for_phone_test(media_module, reply_cid="monitor", result=200):
     coord = types.SimpleNamespace(
         mqtt_connected=True, cliid="client", sndtpc="unit/send/client", rcvtpc="unit/recv/client",
         call_answered=lambda: None, call_ended=lambda *args: None,
+        hass=types.SimpleNamespace(config=types.SimpleNamespace(path=lambda sub: str(Path("/tmp") / "aiphone-unit-tests" / sub)), async_create_task=asyncio.create_task),
     )
     video = media_module.VideoCapture(coord)
 
@@ -422,6 +423,8 @@ def monitor_for_phone_test(media_module, reply_cid="monitor", result=200):
     coord.publish = publish
     video._mon_cid = "monitor"
     video._mon_pc2 = object()
+    from aiphone_test.audio import UplinkAudioTrack
+    video._uplink = UplinkAudioTrack()
     video.live.ready.set()
     return video, messages
 
@@ -490,8 +493,8 @@ async def test_monitor_teardown_finishes_pending_phone_request(media_module):
 
 @pytest.mark.parametrize("state,monitor,expected_mid", [
     ("idle", "monitor", "23022"),
-    ("ringing", "monitor", "24002"),
-    ("idle", None, None),
+    ("ringing", None, "24002"),
+    ("idle", None, "23022"),
 ])
 @pytest.mark.asyncio
 async def test_answer_routes_monitor_and_ring_separately(
@@ -514,8 +517,14 @@ async def test_answer_routes_monitor_and_ring_separately(
     monkeypatch.setitem(sys.modules, spec.name, module)
     spec.loader.exec_module(module)
     messages = []
-    video = types.SimpleNamespace(_mon_cid=monitor, async_start_monitor_talk=AsyncMock(return_value=True),
+    lease = types.SimpleNamespace(stop=lambda: None)
+    video = types.SimpleNamespace(_mon_cid=monitor, session_cid="old-ring" if state == "ringing" else "monitor", async_start_monitor_talk=AsyncMock(return_value=True),
                                   async_answer_ring=AsyncMock(return_value=True))
+    async def open_video():
+        if state == "idle" and not video._mon_cid:
+            video._mon_cid = "monitor"
+        return lease
+    video.async_viewer_track = open_video
     coord = types.SimpleNamespace(
         doorbell_state=state, _active_cid="old-ring", video=video,
         cliid="client", sndtpc="send", rcvtpc="recv",

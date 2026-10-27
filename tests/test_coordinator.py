@@ -95,3 +95,78 @@ async def test_old_session_cleanup_cannot_clear_new_call(coordinator):
     coord.call_ended("old-monitor")
     assert coord.active_call_id == "new-ring"
     assert coord.doorbell_state == "ringing"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("head, answered, own", [
+    ({"NCID": "self"}, False, True),     # app rule: NCID == own client id
+    ({"NCID": "app"}, True, False),      # another terminal answered
+    ({}, True, True),                    # no NCID: we already sent 24002
+    ({}, False, False),                  # no NCID: genuine cancel while ringing
+])
+async def test_call_cancel_for_our_own_answer_keeps_the_call(coordinator, head, answered, own):
+    coord, messages, tasks = coordinator
+    coord._active_cid = coord.video._passive_cid = "ring"
+    coord.video._answer_requested = answered
+    coord._dispatch({"HEADER": {"MID": "23004", "CID": "ring", "CLIID": "door", **head}})
+    await asyncio.gather(*tasks)
+    if own:
+        assert not messages
+        coord.video.async_hang_up.assert_not_called()
+    else:
+        assert messages[0]["HEADER"]["MID"] == "24004"
+        coord.video.async_hang_up.assert_awaited_once_with(remote=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mid", ["23003", "23004", "24002"])
+async def test_cloud_end_clears_ring_before_media_exists(coordinator, mid):
+    coord, _, tasks = coordinator
+    coord._active_cid, coord.doorbell_state = "ring", "ringing"
+    coord._dispatch({"HEADER":{"MID":mid, "CID":"ring", "CLIID":"other-app", "RSLT":200}})
+    assert coord.doorbell_state == "idle"
+    assert coord.active_call_id is None
+    await asyncio.gather(*tasks)
+    coord.video.async_hang_up.assert_awaited_once_with(remote=True)
+
+
+@pytest.mark.asyncio
+async def test_replayed_cloud_ring_cannot_restart_an_ended_call(coordinator):
+    coord, messages, tasks = coordinator
+    ring = {"HEADER":{"MID":"23001", "CID":"ring", "CLIID":"door"}}
+    coord._dispatch(ring)
+    await asyncio.gather(*tasks)
+    coord.call_ended("ring")
+    coord._dispatch(ring)
+    assert coord.doorbell_state == "idle"
+    assert len(messages) == 1
+    coord.video.passive_capture.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_disabled_unlock_cannot_publish_even_if_old_entity_is_called(coordinator):
+    coord, messages, _ = coordinator
+    coord.entry.options = {"enable_unlock":False}
+    with pytest.raises(RuntimeError, match="not enabled"):
+        coord.async_unlock_door()
+    assert not messages
+
+
+@pytest.mark.asyncio
+async def test_quick_reply_background_request_is_coalesced_and_can_be_stopped(coordinator):
+    coord, _, _ = coordinator
+    coord._client = types.SimpleNamespace(is_connected=lambda: True)
+    coord.entry.options = {"enable_reply":True}
+    waiting = asyncio.Event()
+    async def play():
+        waiting.set()
+        await asyncio.Future()
+    coord.async_play_reply = AsyncMock(side_effect=play)
+    coord.start_reply()
+    coord.start_reply()
+    await waiting.wait()
+    assert coord.reply_active
+    assert coord.async_play_reply.await_count == 1
+    await coord.async_stop_reply()
+    assert not coord.reply_active
+    assert coord.doorbell_state == "idle"

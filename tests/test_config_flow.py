@@ -121,3 +121,26 @@ async def test_discovery_timeout_becomes_flow_error_and_allows_retry(flow_module
         if not task.done():
             task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_options_keep_other_values_and_allow_bundled_reply(flow_module):
+    entry = types.SimpleNamespace(options={"reply_audio_file":"old.wav", "unrelated":"keep"})
+    flow = flow_module.AiphoneOptionsFlow(entry)
+    flow.async_create_entry = lambda **kwargs: kwargs
+    result = await flow.async_step_init({"reply_audio_file":"", "enable_unlock":False, "enable_reply":True,
+                                         "enable_ring_sensor":True, "auto_answer":"ringing", "video_mode":"status_osd"})
+    assert result["data"]["reply_audio_file"] == ""
+    assert result["data"]["unrelated"] == "keep"
+    assert result["data"]["enable_unlock"] is False
+    assert entry.options["reply_audio_file"] == "old.wav"
+
+
+@pytest.mark.asyncio
+async def test_options_reject_remote_or_escaping_reply_filename(flow_module):
+    flow = flow_module.AiphoneOptionsFlow(types.SimpleNamespace(options={}))
+    result = await flow.async_step_init({"reply_audio_file":"../private.wav"})
+    assert result["errors"] == {"reply_audio_file":"invalid_reply_filename"}
+    defaults = result["data_schema"]({})
+    assert defaults["enable_ring_sensor"]
+    assert defaults["auto_answer"] == "off"

@@ -151,12 +151,6 @@ class ReplyPublisher:
         self.status = value
         self.coord.notify_reply_state()
 
-    def _require_ringing(self) -> None:
-        if not self._cid or self.coord.active_call_id != self._cid:
-            raise ReplyError("The incoming call is no longer active.")
-        if self.coord.doorbell_state != "ringing":
-            raise ReplyError("Reply is available only while a visitor is ringing.")
-
     def on_signal(self, mid: str, raw: dict) -> None:
         if not self.busy:
             return
@@ -168,7 +162,7 @@ class ReplyPublisher:
             return
         if cid != self._cid:
             return
-        if mid in ("23003", "23004"):
+        if mid == "23003" or (mid == "23004" and not self.coord.video.is_own_cancel(head, cid)):
             self._remote_stop = True
             self.cancel()
         elif mid == "24002" and str(head.get("RSLT")) == "200":
@@ -193,10 +187,9 @@ class ReplyPublisher:
     async def play(self, directory: Path, filename: str) -> None:
         if self.busy:
             raise ReplyError("A prerecorded reply is already in progress.")
-        if self.coord.video._talk_owner is not None:
-            raise ReplyError("A microphone is already active")
-        self._cid = self.coord.active_call_id
-        self._require_ringing()
+        if not self.coord.mqtt_connected:
+            raise ReplyError("Aiphone is not connected")
+        self._cid = self.coord.video.session_cid or self.coord.active_call_id
         self.last_error = None
         self._remote_stop = False
         self._task = asyncio.create_task(self._run(directory, filename))
@@ -248,36 +241,43 @@ class ReplyPublisher:
         track = GatedAudioTrack(player.audio)
         video = self.coord.video
         try:
-            self._require_ringing()
             self._status("connecting")
+            lease = await video.async_viewer_track()
+            lease.stop()
+            self._cid = video.session_cid
+            if not self._cid:
+                raise ReplyError("The call has ended")
             self._status("accepting")
-            await video.async_answer_ring(self._cid)
-            if self.coord.active_call_id != self._cid:
-                raise ReplyError("The incoming call has ended")
+            if not await self.coord.async_answer_call():
+                raise ReplyError("The call could not be answered")
+            await video.wait_for_reply_audio(self._cid)
             if video._uplink is None:
                 raise ReplyError("The audio publisher is unavailable")
+            video._uplink.pause()
+            video._uplink.max_queue_frames = 64
             video._uplink.claim("prerecorded-reply", track)
             track.begin()
             self._status("sending")
             before = video._uplink.frames_sent
             await asyncio.wait_for(track.finished.wait(), MAX_REPLY_SECONDS + 2)
-            await asyncio.sleep(.15)
+            video._uplink.finish_source("prerecorded-reply")
+            await video._uplink.drain()
             if track.error or not track.file_samples:
                 raise ReplyError(track.error or "No audio frames were sent")
             if video._uplink.frames_sent <= before:
                 raise ReplyError("No reply audio frames were transmitted")
-            _LOGGER.info("Prerecorded reply completed (speaker verification required)")
+            _LOGGER.info("Quick reply finished; call remains connected")
             self._status("sent")
         except (TimeoutError, RuntimeError) as err:
             raise ReplyError(str(err)) from err
         finally:
             if video._uplink:
                 video._uplink.release("prerecorded-reply")
+                video._uplink.max_queue_frames = video._uplink.MAX_QUEUE_FRAMES
+                video._uplink.resume()
             track.stop()
             await asyncio.to_thread(_close_player, player)
-            # The app releases its sender and disconnects after a reply.
-            if video.session_cid == self._cid:
-                await video.async_hang_up(remote=self._remote_stop)
+
 
 
 def _close_player(player: PreparedAudio) -> None:

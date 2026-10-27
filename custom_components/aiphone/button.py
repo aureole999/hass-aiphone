@@ -10,7 +10,7 @@ from homeassistant.helpers.device_registry import CONNECTION_NETWORK_MAC, Device
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 
-from .const import DOMAIN, SIGNAL_STATE_UPDATE, STATE_RINGING
+from .const import DOMAIN, SIGNAL_STATE_UPDATE
 from .coordinator import AiphoneCoordinator
 from .reply import ReplyError
 
@@ -25,8 +25,7 @@ async def async_setup_entry(
         AiphoneMonitorButton(coord),
         AiphoneAnswerButton(coord),
         AiphoneHangUpButton(coord),
-        AiphoneReplyButton(coord),
-        AiphoneStopReplyButton(coord),
+        *([AiphoneReplyButton(coord), AiphoneStopReplyButton(coord)] if coord.reply_enabled else []),
     ])
 
 
@@ -104,17 +103,12 @@ class AiphoneReplyButton(_ReplyButtonBase):
 
     @property
     def available(self) -> bool:
-        return (
-            self._coord.mqtt_connected
-            and self._coord.doorbell_state == STATE_RINGING
-            and self._coord.active_call_id is not None
-            and not self._coord.reply.busy
-        )
+        return self._coord.reply_enabled and self._coord.mqtt_connected and not self._coord.reply_active
 
     async def async_press(self) -> None:
         try:
-            await self._coord.async_play_reply()
-        except ReplyError as err:
+            self._coord.start_reply()
+        except (ReplyError, RuntimeError) as err:
             raise HomeAssistantError(str(err)) from err
 
 
@@ -128,10 +122,10 @@ class AiphoneStopReplyButton(_ReplyButtonBase):
 
     @property
     def available(self) -> bool:
-        return self._coord.reply.busy
+        return self._coord.reply_active
 
     async def async_press(self) -> None:
-        await self._coord.reply.stop()
+        await self._coord.async_stop_reply()
 
 
 class AiphoneHangUpButton(ButtonEntity):

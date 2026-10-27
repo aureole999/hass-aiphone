@@ -1,16 +1,7 @@
-"""Image: last snapshot extracted from the most-recently finalized recording.
-
-Distinct from `camera.aiphone_wp_2med_entrance` which serves a live frame
-from in-progress captures (or the latest mp4 when idle). This entity is
-specifically the still image of the last visitor — meant to be the
-counterpart of `sensor.last_recording` for use in dashboards / automations.
-"""
+"""Last decoded camera snapshot, available without opening a video session."""
 from __future__ import annotations
 
-import io
-import logging
 from datetime import datetime, timezone
-from pathlib import Path
 
 from homeassistant.components.image import ImageEntity
 from homeassistant.config_entries import ConfigEntry
@@ -19,11 +10,8 @@ from homeassistant.helpers.device_registry import CONNECTION_NETWORK_MAC, Device
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN, SIGNAL_CAMERA_REFRESH
+from .const import DOMAIN, SIGNAL_SNAPSHOT_UPDATE
 from .coordinator import AiphoneCoordinator
-
-_LOGGER = logging.getLogger(__name__)
-
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -51,69 +39,19 @@ class AiphoneLastSnapshot(ImageEntity):
             manufacturer="Aiphone",
             model="WP-2MED",
         )
-        self._cached_path: Path | None = None
-        self._cached_jpeg: bytes | None = None
-
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
         self.async_on_remove(
-            async_dispatcher_connect(self.hass, SIGNAL_CAMERA_REFRESH, self._on_refresh)
+            async_dispatcher_connect(self.hass, SIGNAL_SNAPSHOT_UPDATE, self._on_refresh)
         )
-        # Seed image_last_updated from the existing latest recording (off the
-        # event loop because it does a synchronous glob/stat).
-        await self._async_refresh_and_write()
+        self._on_refresh()
 
     @callback
     def _on_refresh(self) -> None:
-        # SIGNAL_CAMERA_REFRESH = recording finalized. Invalidate cache, refresh
-        # image_last_updated (off-loop), then notify HA. Don't fire-and-forget
-        # the executor job — must wait so write_ha_state sees the new mtime.
-        self._cached_path = None
-        self._cached_jpeg = None
-        self.hass.async_create_task(self._async_refresh_and_write())
-
-    async def _async_refresh_and_write(self) -> None:
-        await self.hass.async_add_executor_job(self._refresh_image_last_updated_sync)
+        captured = self._coord.video.snapshot.captured_at
+        if captured is not None:
+            self._attr_image_last_updated = datetime.fromtimestamp(captured, tz=timezone.utc)
         self.async_write_ha_state()
 
-    def _refresh_image_last_updated_sync(self) -> None:
-        latest = self._coord.video.latest_recording
-        if latest:
-            try:
-                self._attr_image_last_updated = datetime.fromtimestamp(
-                    latest.stat().st_mtime, tz=timezone.utc
-                )
-            except OSError:
-                pass
-
     async def async_image(self) -> bytes | None:
-        latest = self._coord.video.latest_recording
-        if latest is None:
-            return None
-        if self._cached_path == latest and self._cached_jpeg is not None:
-            return self._cached_jpeg
-        jpeg = await self.hass.async_add_executor_job(_extract_first_frame, latest)
-        if jpeg:
-            self._cached_path = latest
-            self._cached_jpeg = jpeg
-        return jpeg
-
-
-def _extract_first_frame(mp4: Path) -> bytes | None:
-    """Pull the first decodable video frame from `mp4` and return JPEG bytes."""
-    try:
-        import av  # PyAV — already a dependency via aiortc/MediaRecorder
-    except ImportError:
-        _LOGGER.error("PyAV not available — cannot decode mp4")
-        return None
-    try:
-        with av.open(str(mp4)) as container:
-            video = container.streams.video[0]
-            for frame in container.decode(video):
-                img = frame.to_image()
-                buf = io.BytesIO()
-                img.save(buf, format="JPEG", quality=85)
-                return buf.getvalue()
-    except Exception as e:  # noqa: BLE001
-        _LOGGER.warning("first-frame extract failed for %s: %s", mp4.name, e)
-    return None
+        return await self._coord.video.snapshot.picture()

@@ -39,6 +39,7 @@ function fixture({denied = false, connected = true} = {}) {
     callWS:async()=>[
       {entity_id:'camera.entrance',config_entry_id:'entry',platform:'aiphone',unique_id:'camera'},
       {entity_id:'button.end',config_entry_id:'entry',platform:'aiphone',unique_id:'id_hang_up'},
+      {entity_id:'switch.reply',config_entry_id:'entry',platform:'aiphone',unique_id:'id_quick_reply'},
     ],
     callService:async(...args)=>services.push(args),
     connection:{subscribeMessage:async(callback,message)=>{
@@ -95,4 +96,12 @@ test('Hangup during permission prompt prevents late capture from reopening a cal
   grant({getTracks:()=>[f.audioTrack],getAudioTracks:()=>[f.audioTrack]});
   await starting;
   assert.equal(f.audioTrack.stopped,true); assert.equal(f.offers.length,0);
+});
+
+
+test('Quick reply uses the switch without opening media or requesting microphone', async()=>{
+  const f=fixture(); await f.card._action('reply');
+  assert.equal(f.micRequests,0);
+  assert.equal(f.offers.length,0);
+  assert.deepEqual(JSON.parse(JSON.stringify(f.services)),[['switch','turn_on',{entity_id:'switch.reply'}]]);
 });

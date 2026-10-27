@@ -26,6 +26,8 @@ async def async_setup_entry(
             AiphoneLastCaller(coord),
             AiphoneLastRecording(coord),
             AiphoneReplyStatus(coord),
+            AiphoneCallStatus(coord),
+            AiphoneConnectionStatus(coord),
         ]
     )
 
@@ -99,8 +101,7 @@ class AiphoneReplyStatus(_AiphoneSensorBase):
 
     @property
     def extra_state_attributes(self) -> dict:
-        return {"last_error": self._coord.reply.last_error,
-                "speaker_playback_verified": False}
+        return {"last_error": self._coord.reply.last_error}
 
 
 class AiphoneLastRecording(SensorEntity):
@@ -181,3 +182,29 @@ class AiphoneLastRecording(SensorEntity):
     @property
     def extra_state_attributes(self) -> dict | None:
         return self._cached_attrs
+
+
+class AiphoneCallStatus(_AiphoneSensorBase):
+    _attr_name = "Call status"
+    _attr_icon = "mdi:phone"
+
+    def __init__(self, coordinator):
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{coordinator.device_id}_call_status"
+
+    @property
+    def native_value(self):
+        return self._coord.video.call_status
+
+
+class AiphoneConnectionStatus(_AiphoneSensorBase):
+    _attr_name = "Connection"
+    _attr_icon = "mdi:lan-connect"
+
+    def __init__(self, coordinator):
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{coordinator.device_id}_connection"
+
+    @property
+    def native_value(self):
+        return "connected" if self._coord.mqtt_connected else "disconnected"

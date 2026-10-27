@@ -1,6 +1,6 @@
 [project]
 name = "hass-aiphone"
-version = "0.2.0b7"
+version = "0.2.0b8"
 description = "Home Assistant integration for Aiphone WP-2MED video intercoms"
 requires-python = ">=3.11"
 license = { text = "MIT" }

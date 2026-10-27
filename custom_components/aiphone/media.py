@@ -31,7 +31,7 @@ from ._deps import ensure_runtime_deps
 ensure_runtime_deps()
 
 from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
-from aiortc.contrib.media import MediaRecorder
+from aiortc.contrib.media import MediaBlackhole, MediaRecorder
 from aiortc.mediastreams import MediaStreamTrack
 
 from homeassistant.helpers.dispatcher import async_dispatcher_send
@@ -42,9 +42,12 @@ from .const import (
     RECORDINGS_SUBDIR,
     SDP_OFFER_GATHER_TIMEOUT_S,
     SIGNAL_CAMERA_REFRESH,
+    SIGNAL_SNAPSHOT_UPDATE,
 )
 from .live import LiveVideoRelay
 from .audio import UplinkAudioTrack, prefer_pcmu
+from .snapshot import SnapshotCache
+from .const import CONF_AUTO_ANSWER, CONF_VIDEO_MODE, CONF_RECORD_VIDEO
 
 if TYPE_CHECKING:
     from .coordinator import AiphoneCoordinator
@@ -104,6 +107,23 @@ class _PassthroughVideoTrack(MediaStreamTrack):
     async def recv(self):
         frame = await self._source.recv()
         self._holder._latest_video_frame = frame
+        self._holder._video_received_at = time.monotonic()
+        self._holder.snapshot.observe(frame)
+        return frame
+
+
+class _ObservedAudioTrack(MediaStreamTrack):
+    kind = "audio"
+
+    def __init__(self, source, holder):
+        super().__init__()
+        self.source, self.holder = source, holder
+
+    async def recv(self):
+        frame = await self.source.recv()
+        self.holder._latest_audio_frame = frame
+        self.holder._audio_received_at = time.monotonic()
+        self.holder._audio_frames += 1
         return frame
 
 
@@ -214,6 +234,17 @@ class VideoCapture:
         self._remote_ended = False
         self._released: set[str] = set()
         self._talk_owner: str | None = None
+        self._accepted_at = self._audio_received_at = self._video_received_at = 0.0
+        self._audio_frames = 0
+        self._latest_audio_frame = None
+        self._answering = False
+        self._audio_was_ready = False
+        self._call_timeout = None
+        identity = f"{getattr(coord, 'unit_mac', '')}:{coord.cliid}"
+        self.snapshot = SnapshotCache(
+            Path(coord.hass.config.path("aiphone/snapshots")), identity,
+            lambda: async_dispatcher_send(coord.hass, SIGNAL_SNAPSHOT_UPDATE),
+        )
 
     @property
     def recordings_dir(self) -> Path:
@@ -221,18 +252,103 @@ class VideoCapture:
         d.mkdir(parents=True, exist_ok=True)
         return d
 
-    async def async_live_jpeg(self) -> bytes | None:
-        """Return JPEG of the most recently received video frame, or None."""
-        frame = self._latest_video_frame
-        if frame is None:
-            return None
-        return await self.coord.hass.async_add_executor_job(_frame_to_jpeg, frame)
+    @property
+    def options(self):
+        return getattr(getattr(self.coord, "entry", None), "options", {})
+
+    @property
+    def call_status(self) -> str:
+        if not self.coord.mqtt_connected:
+            return "offline"
+        reply = getattr(self.coord, "reply", None)
+        if reply and reply.busy:
+            return "playing_reply" if reply.status == "sending" else "preparing_reply"
+        if self._answering:
+            return "requesting_call"
+        if not self._accepted:
+            if self.coord.doorbell_state == "ringing":
+                return "ringing"
+            return "monitoring" if self.session_cid else "idle"
+        ready = self.talk_audio_ready
+        if not self._talk_owner:
+            return "answered_mic_off" if ready else "connecting_audio"
+        sending = self._uplink and self._uplink.owner == self._talk_owner and time.monotonic() - self._uplink.last_frame_sent_at < 1.5
+        if ready and sending:
+            self._audio_was_ready = True
+            return "in_call"
+        return "audio_interrupted" if self._audio_was_ready else "connecting_audio"
+
+    @property
+    def talk_audio_ready(self) -> bool:
+        publisher = self._ring_publisher or self._mon_pc1
+        subscriber = self._passive_pc or self._mon_pc2
+        return bool(self._accepted and self._uplink and self._uplink.enabled
+                    and publisher and publisher.connectionState == "connected"
+                    and subscriber and subscriber.connectionState == "connected"
+                    and self._audio_received_at >= self._accepted_at
+                    and time.monotonic() - self._audio_received_at < 1.5)
+
+    async def wait_for_reply_audio(self, cid: str, timeout: float = 15) -> None:
+        stable = None
+        async with asyncio.timeout(timeout):
+            while True:
+                if self._closing or self.session_cid != cid:
+                    raise RuntimeError("The call has ended")
+                now = time.monotonic()
+                if self.talk_audio_ready:
+                    stable = stable if stable is not None else now
+                    if now - stable >= .3:
+                        return
+                else:
+                    stable = None
+                await asyncio.sleep(.02)
+
+    def _call_accepted(self) -> None:
+        self._accepted = True
+        self._accepted_at = time.monotonic()
+        self._audio_was_ready = False
+        self._uplink.enabled = True
+        self.coord.call_answered()
+        if self._call_timeout:
+            self._call_timeout.cancel()
+        self._call_timeout = asyncio.get_running_loop().call_later(
+            300, lambda: self.coord.hass.async_create_task(self.async_hang_up())
+        )
+
+    async def async_live_jpeg(self) -> bytes:
+        return await self.snapshot.picture()
+
+    async def async_foreground_track(self) -> MediaStreamTrack:
+        if self.options.get(CONF_VIDEO_MODE) == "status_osd":
+            from .status_video import StatusVideoTrack
+            return StatusVideoTrack(self)
+        return await self.async_viewer_track()
+
+    async def async_auto_answer(self, active) -> None:
+        mode = self.options.get(CONF_AUTO_ANSWER, "off")
+        ring = self.coord.active_call_id if self.coord.doorbell_state == "ringing" else None
+        if mode == "off" or not active() or not self.coord.mqtt_connected or mode == "ringing" and not ring:
+            return
+        lease = await self.async_viewer_track()
+        lease.stop()
+        cid = self.session_cid
+        def allowed():
+            selected = self.options.get(CONF_AUTO_ANSWER, "off")
+            return (not self._closing and active() and self.coord.mqtt_connected
+                    and cid == self.session_cid and selected != "off"
+                    and (mode != "ringing" or ring == cid)
+                    and (selected == "always" or self.coord.active_call_id == cid and self.coord.doorbell_state == "ringing"))
+        if allowed():
+            if self._mon_cid:
+                await self.async_start_monitor_talk(allowed)
+            else:
+                await self.async_answer_ring(cid, allowed)
 
     async def async_viewer_track(self) -> MediaStreamTrack:
         """Reuse a ring/monitor capture, or start monitoring without answering."""
         if self._closing or not self.coord.mqtt_connected:
             raise RuntimeError("Aiphone is not connected")
-        if not self._lock.locked() and (
+        if self.coord.doorbell_state != "ringing" and not self._lock.locked() and (
             self._monitor_request is None or self._monitor_request.done()
         ):
             self._monitor_request = self.coord.hass.async_create_task(self.monitor_capture())
@@ -240,9 +356,12 @@ class VideoCapture:
 
     def viewer_audio_track(self) -> MediaStreamTrack | None:
         """Share incoming audio without sending an answer-call command."""
+        if self.options.get(CONF_VIDEO_MODE) == "status_osd":
+            from .status_video import StatusAudioTrack
+            return StatusAudioTrack(self)
         return self.live.subscribe_audio()
 
-    async def async_start_monitor_talk(self) -> bool:
+    async def async_start_monitor_talk(self, continue_if=None) -> bool:
         """Mirror the official app's phone button (23022 -> matching 24022)."""
         async with self._monitor_talk_lock:
             cid = self._mon_cid
@@ -252,6 +371,9 @@ class VideoCapture:
                 raise RuntimeError("Open Monitor and wait for the video before pressing Answer")
             if self._monitor_talking:
                 return True
+            if continue_if and not continue_if():
+                return False
+            self._answering = True
             future = self._mon_fut_24022 = asyncio.get_running_loop().create_future()
             try:
                 if not self.coord.publish({"HEADER": {
@@ -271,13 +393,11 @@ class VideoCapture:
                 if self._mon_cid != cid:
                     raise RuntimeError("The monitor session ended before talk was enabled")
                 self._monitor_talking = True
-                self._accepted = True
-                if self._uplink:
-                    self._uplink.enabled = True
-                self.coord.call_answered()
+                self._call_accepted()
                 _LOGGER.info("Monitor phone-button request accepted (24022 RSLT=200)")
                 return True
             finally:
+                self._answering = False
                 if not future.done():
                     future.cancel()
                 if self._mon_fut_24022 is future:
@@ -290,6 +410,22 @@ class VideoCapture:
             if pc.connectionState == "failed" and task and not task.cancelling():
                 _LOGGER.warning("Doorbell media connection failed; closing call")
                 await self.async_hang_up()
+
+    def answering_ring(self, cid: str) -> bool:
+        """True once this terminal has sent 24002 for the given ringing call."""
+        return self._passive_cid == cid and (self._answer_requested or self._accepted)
+
+    def is_own_cancel(self, head: dict, cid: str) -> bool:
+        """True when a 23004 only tells the other terminals that *we* answered.
+
+        Mirrors RelayManager.onSignalRcv in the official app, which drops a
+        CALL_CANCEL_REQ whose NCID is its own client id.
+        """
+        ncid = head.get("NCID") or head.get("NCLIID")
+        if ncid:
+            return ncid == self.coord.cliid
+        # Firmware/cloud without NCID: fall back to whether we sent 24002.
+        return self.answering_ring(cid)
 
     @property
     def session_cid(self) -> str | None:
@@ -349,24 +485,29 @@ class VideoCapture:
         if pc.connectionState != "connected":
             raise RuntimeError("The doorbell audio publisher could not connect")
 
-    async def async_answer_ring(self, cid: str) -> bool:
+    async def async_answer_ring(self, cid: str, continue_if=None) -> bool:
         async with self._talk_lock:
             if self._accepted and self._passive_cid == cid:
                 return True
-            await asyncio.wait_for(self._passive_ready.wait(), 30)
-            if self._passive_cid != cid or self.coord.active_call_id != cid:
-                raise RuntimeError("The ringing call has ended")
+            self._answering = True
+            self.coord.notify_reply_state()
             try:
+                await asyncio.wait_for(self._passive_ready.wait(), 30)
+                if self._passive_cid != cid or self.coord.active_call_id != cid:
+                    raise RuntimeError("The ringing call has ended")
+                if continue_if and not continue_if():
+                    return False
                 if self._ring_publisher is None:
                     await self._start_ring_publisher(cid)
+                if continue_if and not continue_if():
+                    return False
                 self._answer_requested = True
-                await self._request("24002", "25001", cid, CKIND=self.coord.call_kind,
+                # The app waits 17 s for REP_RCV_NFY (CallManager.getReplyRequests).
+                await self._request("24002", "25001", cid, timeout=17, CKIND=self.coord.call_kind,
                                     RECKIND=0, AVID=0, RSLT=200, REASON=0)
                 if self._passive_cid != cid or self.coord.active_call_id != cid:
                     raise RuntimeError("The ringing call ended while answering")
-                self._accepted = True
-                self._uplink.enabled = True
-                self.coord.call_answered()
+                self._call_accepted()
                 return True
             except BaseException as err:
                 if isinstance(err, SignalingRejected):
@@ -377,6 +518,9 @@ class VideoCapture:
                     await self._ring_publisher.close()
                 self._ring_publisher = self._uplink = None
                 raise
+            finally:
+                self._answering = False
+                self.coord.notify_reply_state()
 
     async def async_microphone(self, source, owner: str) -> None:
         if self.coord.reply.busy:
@@ -402,6 +546,8 @@ class VideoCapture:
         if self._uplink:
             self._uplink.release(owner)
         self._talk_owner = None
+        if self.coord.reply.busy:
+            return
         # Closing the talking client ends its call; other viewers cannot
         # silently keep an active microphone or a cloud call alive.
         await self.async_hang_up()
@@ -462,6 +608,10 @@ class VideoCapture:
         head = raw.get("HEADER", {}) or {}
         body = raw.get("BODY", {}) or {}
         cid = head.get("CID")
+        sender = head.get("CLIID")
+        own_cliid = getattr(self.coord, "cliid", None)
+        if mid.startswith("31") and sender and own_cliid and sender != own_cliid:
+            return
 
         if cid is not None and cid == self.session_cid:
             future = self._signals.get(mid)
@@ -497,6 +647,12 @@ class VideoCapture:
         self._passive_ended.clear()
         self._passive_ready.clear()
         self._accepted = self._answer_requested = self._remote_ended = False
+        await self.snapshot.flush(self._latest_video_frame)
+        if self._call_timeout:
+            self._call_timeout.cancel()
+            self._call_timeout = None
+        self._answering = False
+        self._latest_audio_frame = None
         self.live.end()
         self._latest_video_frame = None
         try:
@@ -523,7 +679,7 @@ class VideoCapture:
         pc = RTCPeerConnection(RTCConfiguration(iceServers=[]))
         pc.addTransceiver("audio", direction="recvonly")
         pc.addTransceiver("video", direction="recvonly")
-        rec = MediaRecorder(str(self._passive_path))
+        rec = MediaRecorder(str(self._passive_path)) if self.options.get(CONF_RECORD_VIDEO, True) else MediaBlackhole()
         @pc.on("track")
         def _on_track(track):
             elapsed = time.time() - passive_t0
@@ -551,9 +707,9 @@ class VideoCapture:
                 # stats below to confirm packets actually arrive.
                 _LOGGER.info("🎤 AUDIO TRACK ATTACHED — recorder will receive frames if RTP flows")
             if track.kind == "video":
-                rec.addTrack(self.live.attach(_PassthroughVideoTrack(track, self)))
+                rec.addTrack(self.live.attach(_PassthroughVideoTrack(track, self), mark_ready=False))
             else:
-                rec.addTrack(self.live.attach(track))
+                rec.addTrack(self.live.attach(_ObservedAudioTrack(track, self)))
         self._watch_peer(pc)
         self._passive_pc = pc
         self._passive_recorder = rec
@@ -605,8 +761,9 @@ class VideoCapture:
         self.coord.publish(msg2)
 
         self._send("24001", cid, CKIND=self.coord.call_kind, RSLT=200)
-        self._passive_ready.set()
         await rec.start()
+        self.live.ready.set()
+        self._passive_ready.set()
         _LOGGER.info("🎬 passive recorder started — will stop %ss after disconnect",
                      PASSIVE_HOLD_AFTER_END_S)
 
@@ -654,6 +811,12 @@ class VideoCapture:
         self._passive_ready.clear()
         self._talk_owner = None
         self._accepted = False
+        await self.snapshot.flush(self._latest_video_frame)
+        if self._call_timeout:
+            self._call_timeout.cancel()
+            self._call_timeout = None
+        self._answering = False
+        self._latest_audio_frame = None
         self.live.end()
         self._latest_video_frame = None
         self._passive_pc = self._passive_recorder = None
@@ -724,14 +887,14 @@ class VideoCapture:
         pc2 = RTCPeerConnection(RTCConfiguration(iceServers=[]))
         pc2.addTransceiver("audio", direction="recvonly")
         pc2.addTransceiver("video", direction="recvonly")
-        rec = MediaRecorder(str(self._mon_path))
+        rec = MediaRecorder(str(self._mon_path)) if self.options.get(CONF_RECORD_VIDEO, True) else MediaBlackhole()
         @pc2.on("track")
         def _on_track(track):
             _LOGGER.info("🎥 monitor track: %s", track.kind)
             if track.kind == "video":
-                rec.addTrack(self.live.attach(_PassthroughVideoTrack(track, self)))
+                rec.addTrack(self.live.attach(_PassthroughVideoTrack(track, self), mark_ready=False))
             else:
-                rec.addTrack(self.live.attach(track))
+                rec.addTrack(self.live.attach(_ObservedAudioTrack(track, self)))
         self._watch_peer(pc2)
         self._mon_pc2 = pc2
         self._mon_recorder = rec
@@ -800,8 +963,11 @@ class VideoCapture:
             _LOGGER.warning("31012 timeout (non-fatal)")
 
         await rec.start()
+        self.live.ready.set()
         _LOGGER.info("🎬 monitor recording, holding %ss", duration_s)
-        await self.live.hold_monitor(duration_s, reconnect_grace=20)
+        await self.live.hold_monitor(duration_s, reconnect_grace=15)
+        if self._accepted:
+            await asyncio.Future()
 
     async def aclose(self) -> None:
         """Coordinator shutdown — drop any in-flight capture cleanly."""
@@ -827,6 +993,12 @@ class VideoCapture:
         self._uplink = None
         self._talk_owner = None
         self._accepted = False
+        await self.snapshot.flush(self._latest_video_frame)
+        if self._call_timeout:
+            self._call_timeout.cancel()
+            self._call_timeout = None
+        self._answering = False
+        self._latest_audio_frame = None
         self.live.end()
         self._latest_video_frame = None
         self._mon_pc1 = self._mon_pc2 = self._mon_recorder = None
