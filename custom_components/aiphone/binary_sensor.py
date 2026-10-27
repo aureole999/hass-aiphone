@@ -21,7 +21,7 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     coord: AiphoneCoordinator = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities([AiphoneDoorbell(coord)])
+    async_add_entities([AiphoneDoorbell(coord)] if coord.ring_sensor_enabled else [])
 
 
 class AiphoneDoorbell(BinarySensorEntity):

@@ -3,7 +3,7 @@
     "step": {
       "user": {
         "title": "Aiphone (WP-2MED) — pair a new client",
-        "description": "1. On the WP-2MED main unit, navigate to 設定 → 各種設定 → アプリ連携 → 端末追加 (or similar 'add device' menu).\n2. Wait until the screen shows the 'waiting for app' prompt.\n3. Click Submit below — pairing should complete in 5–10 seconds.\n\nIf this Pi is not on the same LAN as your WP-2MED, this won't work — the pairing protocol uses LAN UDP broadcast and TLS.",
+        "description": "On the indoor station, open Settings → App integration → Add terminal (端末追加), then submit. Home Assistant must be on the same LAN.",
         "data": {
           "termname": "Display name (shown in the unit's call list)"
         }
@@ -14,7 +14,7 @@
       }
     },
     "progress": {
-      "pairing": "Pairing with WP-2MED — discovering on LAN, exchanging OTP, provisioning AWS IoT cert, registering display name…"
+      "pairing": "Pairing with WP-2MED…"
     },
     "error": {
       "wp_not_in_pairing_mode": "WP-2MED did not respond. Make sure the unit is in 端末追加 mode and on the same LAN as Home Assistant.",
@@ -31,10 +31,20 @@
   "options": {
     "step": {
       "init": {
-        "title": "Prerecorded reply",
-        "description": "Experimental: accepts a currently ringing call and attempts to send one local recording. Put the file under /config/aiphone/replies/. Audible playback and remote hangup are not yet verified.",
+        "title": "Aiphone options",
+        "description": "Choose accessories and video behavior. Leave the reply filename blank to use the included Japanese message. Custom recordings go in /config/aiphone/replies/.",
         "data": {
-          "reply_audio_file": "Reply audio filename"
+          "reply_audio_file": "Reply audio filename",
+          "enable_unlock": "Enable unlock control",
+          "enable_reply": "Enable quick reply",
+          "enable_ring_sensor": "Enable ring sensor",
+          "record_video": "Save video recordings",
+          "auto_answer": "Auto answer on live view (experimental)",
+          "video_mode": "Video output (experimental)"
+        },
+        "data_description": {
+          "auto_answer": "Off, only while ringing, or always when opening live video. The phone microphone stays off until you enable it.",
+          "video_mode": "direct: live video. status_osd: cached image while connecting, then live video with status. Uses more CPU."
         }
       }
     },
@@ -45,10 +55,10 @@
   "entity": {
     "button": {
       "play_reply": {
-        "name": "Play prerecorded reply (experimental)"
+        "name": "Quick reply"
       },
       "stop_reply": {
-        "name": "Stop reply sender"
+        "name": "Stop quick reply"
       }
     },
     "sensor": {
@@ -60,7 +70,7 @@
           "connecting": "Connecting",
           "accepting": "Accepting call",
           "sending": "Sending audio",
-          "sent": "Audio sent (speaker unverified)",
+          "sent": "Finished",
           "stopped": "Stopped",
           "failed": "Failed"
         }

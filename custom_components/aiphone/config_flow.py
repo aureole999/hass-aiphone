@@ -31,6 +31,10 @@ from .const import (
     CONFIG_VERSION,
     DOMAIN,
 )
+from .const import (
+    CONF_ENABLE_UNLOCK, CONF_ENABLE_REPLY, CONF_ENABLE_RING_SENSOR,
+    CONF_AUTO_ANSWER, CONF_VIDEO_MODE, CONF_RECORD_VIDEO, AUTO_ANSWER_MODES, VIDEO_MODES,
+)
 from .reply_files import validate_reply_filename
 from .pairing import (
     CloudRegistrationFailed,
@@ -124,6 +128,8 @@ class AiphoneConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._abort_if_unique_id_configured()
         return self.async_create_entry(
             title=f"Aiphone WP-2MED ({self._result['unit_mac']})",
+            options={CONF_ENABLE_UNLOCK: False, CONF_ENABLE_REPLY: False,
+                     CONF_ENABLE_RING_SENSOR: True, CONF_RECORD_VIDEO: False},
             data={
                 CONF_CLIID:      self._result["cliid"],
                 CONF_IOT_HOST:   self._result["iot_host"],
@@ -152,7 +158,7 @@ class AiphoneConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
 
 class AiphoneOptionsFlow(config_entries.OptionsFlow):
-    """Select one local recording; never start a call while configuring."""
+    """Configure accessories, audio and experimental video behavior."""
 
     def __init__(self, entry: config_entries.ConfigEntry) -> None:
         self._entry = entry
@@ -161,18 +167,26 @@ class AiphoneOptionsFlow(config_entries.OptionsFlow):
         errors = {}
         if user_input is not None:
             try:
-                filename = validate_reply_filename(user_input[CONF_REPLY_AUDIO_FILE])
+                filename = validate_reply_filename(user_input.get(CONF_REPLY_AUDIO_FILE, ""))
             except ValueError:
                 errors[CONF_REPLY_AUDIO_FILE] = "invalid_reply_filename"
             else:
                 return self.async_create_entry(title="", data={
-                    **self._entry.options, CONF_REPLY_AUDIO_FILE: filename,
+                    **self._entry.options, **user_input, CONF_REPLY_AUDIO_FILE: filename,
                 })
         default = (user_input or self._entry.options).get(
             CONF_REPLY_AUDIO_FILE, DEFAULT_REPLY_AUDIO_FILE
         )
         return self.async_show_form(
             step_id="init",
-            data_schema=vol.Schema({vol.Required(CONF_REPLY_AUDIO_FILE, default=default): str}),
+            data_schema=vol.Schema({
+                vol.Optional(CONF_REPLY_AUDIO_FILE, default=default): str,
+                vol.Optional(CONF_ENABLE_UNLOCK, default=self._entry.options.get(CONF_ENABLE_UNLOCK, True)): bool,
+                vol.Optional(CONF_ENABLE_REPLY, default=self._entry.options.get(CONF_ENABLE_REPLY, True)): bool,
+                vol.Optional(CONF_ENABLE_RING_SENSOR, default=self._entry.options.get(CONF_ENABLE_RING_SENSOR, True)): bool,
+                vol.Optional(CONF_RECORD_VIDEO, default=self._entry.options.get(CONF_RECORD_VIDEO, True)): bool,
+                vol.Optional(CONF_AUTO_ANSWER, default=self._entry.options.get(CONF_AUTO_ANSWER, "off")): vol.In(AUTO_ANSWER_MODES),
+                vol.Optional(CONF_VIDEO_MODE, default=self._entry.options.get(CONF_VIDEO_MODE, "direct")): vol.In(VIDEO_MODES),
+            }),
             errors=errors,
         )

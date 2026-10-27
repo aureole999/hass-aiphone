@@ -41,7 +41,6 @@ def audio_file(tmp_path):
         "https://a/b.wav",
         "a\\b.wav",
         "private.pem",
-        "",
         ".hidden.wav",
     ],
 )
@@ -101,8 +100,9 @@ async def test_real_local_reply_reuses_call_publisher_and_releases(cloud, audio_
         assert cloud.reply.status == "sent"
         assert not cloud.reply.busy
         mids = [m["HEADER"]["MID"] for m in cloud.messages]
-        assert mids == ["30011", "30012", "24001", "30021", "24002", "30031", "23003"]
-        assert cloud.video._ring_publisher is None
+        assert mids == ["30011", "30012", "24001", "30021", "24002"]
+        assert cloud.video._ring_publisher is not None
+        assert cloud.video._accepted
     finally:
         await cloud.close()
 
@@ -120,12 +120,14 @@ async def test_missing_file_cannot_accept_a_call(cloud, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_no_ringing_call_cannot_send_any_command(cloud, audio_file):
-    cloud.doorbell_state = "idle"
+async def test_idle_reply_starts_monitor_and_keeps_call_connected(cloud, audio_file):
+    cloud.doorbell_state, cloud.active_call_id = "idle", None
     try:
-        with pytest.raises(reply.ReplyError, match="only while"):
-            await cloud.reply.play(audio_file.parent, audio_file.name)
-        assert cloud.messages == []
+        await cloud.reply.play(audio_file.parent, audio_file.name)
+        assert cloud.audible.is_set()
+        assert cloud.video._monitor_talking
+        assert cloud.video._uplink.owner is None
+        assert "23003" not in [m["HEADER"]["MID"] for m in cloud.messages]
     finally:
         await cloud.close()
 
@@ -202,19 +204,64 @@ async def test_explicit_stop_closes_real_sender(cloud, audio_file):
         await cloud.reply.stop()
         with pytest.raises(reply.ReplyError, match="stopped"):
             await task
-        assert cloud.video._ring_publisher is None
+        assert cloud.video._ring_publisher is not None
+        assert cloud.video._accepted
         assert not cloud.reply.busy
     finally:
         await cloud.close()
 
 
 @pytest.mark.asyncio
-async def test_prerecorded_reply_cannot_interrupt_a_microphone(cloud, audio_file):
-    cloud.video._talk_owner = "talking-browser"
+async def test_reply_takes_over_and_restores_live_microphone(cloud, audio_file):
+    from test_live import TestTone
+    microphone = TestTone()
     try:
-        with pytest.raises(reply.ReplyError, match="microphone"):
-            await cloud.reply.play(audio_file.parent, audio_file.name)
-        assert not cloud.messages
+        await cloud.ring()
+        await cloud.video.async_microphone(microphone, "talking-browser")
+        await cloud.reply.play(audio_file.parent, audio_file.name)
+        assert cloud.reply.status == "sent"
+        assert cloud.video._uplink.owner == "talking-browser"
         assert cloud.video._talk_owner == "talking-browser"
+        assert microphone.readyState == "live"
+        assert cloud.video._accepted
+    finally:
+        await cloud.close()
+
+
+@pytest.mark.asyncio
+async def test_monitor_reply_reuses_publisher_without_reanswering(cloud, audio_file):
+    try:
+        await cloud.monitor()
+        await cloud.video.async_start_monitor_talk()
+        publisher = cloud.video._mon_pc1
+        await cloud.reply.play(audio_file.parent, audio_file.name)
+        mids = [m["HEADER"]["MID"] for m in cloud.messages]
+        assert mids.count("23022") == 1
+        assert mids.count("30001") == 1
+        assert cloud.video._mon_pc1 is publisher
+        assert cloud.reply.status == "sent"
+        assert cloud.video._accepted
+    finally:
+        await cloud.close()
+
+
+@pytest.mark.asyncio
+async def test_closing_original_microphone_during_reply_keeps_reply_and_does_not_restore_mic(cloud, audio_file):
+    from test_live import TestTone
+    microphone = TestTone()
+    try:
+        await cloud.ring()
+        await cloud.video.async_microphone(microphone, "browser")
+        task = asyncio.create_task(cloud.reply.play(audio_file.parent, audio_file.name))
+        async with asyncio.timeout(5):
+            while cloud.reply.status != "sending":
+                await asyncio.sleep(.01)
+        await cloud.video.async_microphone_closed("browser")
+        await task
+        assert microphone.readyState == "ended"
+        assert cloud.video._talk_owner is None
+        assert cloud.video._uplink.owner is None
+        assert cloud.video._accepted
+        assert cloud.reply.status == "sent"
     finally:
         await cloud.close()

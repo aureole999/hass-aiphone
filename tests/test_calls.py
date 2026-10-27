@@ -265,8 +265,8 @@ async def test_microphone_queue_is_bounded_and_gate_is_silent():
         for _ in range(3):
             assert not has_signal(await track.recv())
         track.enabled = True
-        await asyncio.sleep(.1)
-        assert track._queue.qsize() <= 2
+        await asyncio.sleep(.25)
+        assert track._queue.qsize() <= UplinkAudioTrack.MAX_QUEUE_FRAMES
         assert has_signal(await track.recv())
         with pytest.raises(RuntimeError, match="Another"):
             track.claim("two", source)
@@ -326,3 +326,33 @@ async def test_explicit_hangup_declines_unanswered_ring_without_opening_micropho
         assert cloud.video.session_cid is None
     finally:
         await cloud.close()
+
+
+@pytest.mark.asyncio
+async def test_status_stream_opens_early_and_auto_answers_without_microphone(media_module, tmp_path):
+    cloud = LocalCloud(media_module, tmp_path)
+    cloud.active_call_id, cloud.doorbell_state = None, "idle"
+    cloud.entry = types.SimpleNamespace(options={"video_mode":"status_osd", "auto_answer":"always", "record_video":False})
+    bridge = BrowserVideo(cloud.video.async_foreground_track, cloud.video.viewer_audio_track,
+                          cloud.video.async_microphone, cloud.video.async_microphone_closed,
+                          cloud.video.async_auto_answer)
+    browser = None
+    from test_live import open_browser
+    try:
+        browser, track = await open_browser(bridge, "status", expect_audio=True)
+        first = await asyncio.wait_for(track.recv(), 5)
+        async with asyncio.timeout(5):
+            while not cloud.video._accepted or cloud.video._latest_video_frame is None:
+                await asyncio.sleep(.01)
+        second = await asyncio.wait_for(track.recv(), 5)
+        assert second.pts > first.pts
+        assert cloud.video.call_status in ("answered_mic_off", "connecting_audio")
+        assert cloud.video._talk_owner is None
+        assert not cloud.audible.is_set()
+        assert not list((tmp_path / "aiphone/recordings").glob("*.mp4"))
+    finally:
+        await bridge.aclose()
+        if browser:
+            await browser.close()
+        await cloud.close()
+    assert cloud.video.live.external_viewers == 0

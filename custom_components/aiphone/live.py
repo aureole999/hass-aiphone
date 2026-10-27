@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
@@ -12,7 +13,12 @@ from aiortc.mediastreams import MediaStreamError, MediaStreamTrack
 from aiortc.sdp import candidate_from_sdp
 
 
+_LOGGER = logging.getLogger(__name__)
+
+
 class _ViewerTrack(MediaStreamTrack):
+    MAX_AUDIO_BACKLOG = 25
+
     def __init__(self, proxy: MediaStreamTrack, owner: LiveVideoRelay) -> None:
         super().__init__()
         self.kind = proxy.kind
@@ -22,6 +28,12 @@ class _ViewerTrack(MediaStreamTrack):
     async def recv(self):
         if self.readyState != "live":
             raise MediaStreamError
+        q = getattr(self._proxy, "_queue", None)
+        if q is not None:
+            while q.qsize() > self.MAX_AUDIO_BACKLOG:
+                if q.get_nowait() is None:
+                    self.stop()
+                    raise MediaStreamError
         return await self._proxy.recv()
 
     def stop(self) -> None:
@@ -40,9 +52,10 @@ class LiveVideoRelay:
         self._audio_source: MediaStreamTrack | None = None
         self.ready = asyncio.Event()
         self.viewers: set[_ViewerTrack] = set()
+        self.external_viewers = 0
         self.viewers_changed = asyncio.Event()
 
-    def attach(self, source: MediaStreamTrack) -> MediaStreamTrack:
+    def attach(self, source: MediaStreamTrack, mark_ready: bool = True) -> MediaStreamTrack:
         # SDP may announce audio before video. Replacing one kind must not
         # discard the other kind or disconnect its existing viewers.
         for track in tuple(self.viewers):
@@ -52,7 +65,8 @@ class LiveVideoRelay:
             self._audio_source = source
         else:
             self._source = source
-            self.ready.set()
+            if mark_ready:
+                self.ready.set()
         return self._relay.subscribe(source)
 
     async def subscribe(self, timeout: float = 30) -> MediaStreamTrack:
@@ -70,7 +84,7 @@ class LiveVideoRelay:
         source = self._audio_source
         if source is None or source.readyState != "live":
             return None
-        track = _ViewerTrack(self._relay.subscribe(source, buffered=False), self)
+        track = _ViewerTrack(self._relay.subscribe(source, buffered=True), self)
         self.viewers.add(track)
         self.viewers_changed.set()
         return track
@@ -79,7 +93,7 @@ class LiveVideoRelay:
         """Keep an explicitly opened monitor alive while anyone is watching."""
         await asyncio.sleep(duration)
         while True:
-            while self.viewers:
+            while self.viewers or self.external_viewers:
                 self.viewers_changed.clear()
                 await self.viewers_changed.wait()
             if not reconnect_grace:
@@ -118,11 +132,14 @@ class BrowserVideo:
         get_audio_track: Callable[[], MediaStreamTrack | None] | None = None,
         start_talk: Callable[[MediaStreamTrack, str], Awaitable[None]] | None = None,
         stop_talk: Callable[[str], Awaitable[None]] | None = None,
+        on_open: Callable[[Callable[[], bool]], Awaitable[None]] | None = None,
     ) -> None:
         self._get_track = get_track
         self._get_audio_track = get_audio_track
         self._start_talk = start_talk
         self._stop_talk = stop_talk
+        self._on_open = on_open
+        self._opening: set[asyncio.Task] = set()
         self._sessions: dict[str, _Session] = {}
 
     async def offer(self, sdp: str, session_id: str, answer: Callable[[str], None]) -> None:
@@ -165,6 +182,14 @@ class BrowserVideo:
         transceivers = pc.getTransceivers()
         if not any(t.kind == "video" and t.direction != "inactive" for t in transceivers):
             raise ValueError("The browser did not offer a video track")
+        if self._on_open:
+            task = asyncio.create_task(self._on_open(lambda: self._sessions.get(session_id) is session))
+            self._opening.add(task)
+            def finished(job):
+                self._opening.discard(job)
+                if not job.cancelled() and job.exception():
+                    _LOGGER.warning("Auto answer failed: %s", job.exception())
+            task.add_done_callback(finished)
         track = await self._get_track()
         session.tracks.append(track)
 
@@ -228,3 +253,8 @@ class BrowserVideo:
     async def aclose(self) -> None:
         for session_id in tuple(self._sessions):
             await self.close(session_id)
+        tasks = tuple(self._opening)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)

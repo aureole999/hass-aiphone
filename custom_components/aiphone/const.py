@@ -14,7 +14,7 @@ CONF_SECKEY_PEM = "seckey_pem"
 CONF_TERMNAME = "termname"
 CONF_UNIT_MAC = "unit_mac"
 CONF_REPLY_AUDIO_FILE = "reply_audio_file"
-DEFAULT_REPLY_AUDIO_FILE = "reply.wav"
+DEFAULT_REPLY_AUDIO_FILE = ""
 REPLY_AUDIO_SUBDIR = "aiphone/replies"
 
 # v1 (legacy)
@@ -28,6 +28,7 @@ ALPN_PROTO = "x-amzn-mqtt-ca"
 # Internal dispatcher signals
 SIGNAL_STATE_UPDATE = f"{DOMAIN}_state_update"
 SIGNAL_CAMERA_REFRESH = f"{DOMAIN}_camera_refresh"
+SIGNAL_SNAPSHOT_UPDATE = f"{DOMAIN}_snapshot_update"
 
 # Doorbell state machine
 STATE_IDLE = "idle"
@@ -49,3 +50,13 @@ RECORDINGS_SUBDIR = "aiphone/recordings"     # under /config/
 PASSIVE_HOLD_AFTER_END_S = 8                 # legacy local recording flush interval
 MONITOR_DEFAULT_DURATION_S = 30
 SDP_OFFER_GATHER_TIMEOUT_S = 4
+
+# Optional accessories and foreground video behavior.
+CONF_ENABLE_UNLOCK = "enable_unlock"
+CONF_ENABLE_REPLY = "enable_reply"
+CONF_ENABLE_RING_SENSOR = "enable_ring_sensor"
+CONF_AUTO_ANSWER = "auto_answer"
+CONF_VIDEO_MODE = "video_mode"
+CONF_RECORD_VIDEO = "record_video"
+AUTO_ANSWER_MODES = ("off", "ringing", "always")
+VIDEO_MODES = ("direct", "status_osd")

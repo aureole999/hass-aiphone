@@ -37,6 +37,7 @@ from .const import (
     STATE_IDLE,
     STATE_RINGING,
 )
+from .const import CONF_ENABLE_UNLOCK, CONF_ENABLE_REPLY, CONF_ENABLE_RING_SENSOR
 from .media import VideoCapture, now_sid
 from .reply import ReplyPublisher
 from .media_diagnostics import SignalTrace
@@ -67,6 +68,9 @@ class AiphoneCoordinator:
         self.last_event: dict[str, Any] = {}
         self._active_cid: str | None = None
         self.call_kind = 1
+        self._seen_rings: set[str] = set()
+        self._status_task = None
+        self._reply_request = None
 
         self._client: mqtt.Client | None = None
         self._cert_path: Path | None = None
@@ -81,11 +85,16 @@ class AiphoneCoordinator:
     # lifecycle
     # -------------------------------------------------------------------
     async def async_start(self) -> None:
+        await self.video.snapshot.load()
         await self.hass.async_add_executor_job(self._materialize_certs)
         await self.hass.async_add_executor_job(self._connect)
+        self._status_task = self.hass.async_create_task(self._watch_status())
 
     async def async_stop(self) -> None:
-        await self.reply.stop()
+        if self._status_task:
+            self._status_task.cancel()
+            await asyncio.gather(self._status_task, return_exceptions=True)
+        await self.async_stop_reply()
         await self.video.aclose()
         if self._client is not None:
             await self.hass.async_add_executor_job(self._client.loop_stop)
@@ -140,10 +149,13 @@ class AiphoneCoordinator:
     @callback
     def _connection_lost(self):
         self.reply.cancel()
+        self.call_ended()
         self.hass.async_create_task(self.video.async_hang_up(remote=True))
         self.notify_reply_state()
 
     def _on_message(self, client, userdata, msg):
+        if len(msg.payload) > 256 * 1024:
+            return
         try:
             raw = json.loads(msg.payload)
         except Exception:
@@ -174,10 +186,64 @@ class AiphoneCoordinator:
     def notify_reply_state(self) -> None:
         async_dispatcher_send(self.hass, SIGNAL_STATE_UPDATE)
 
+    @property
+    def options(self):
+        return getattr(self.entry, "options", {})
+
+    @property
+    def reply_enabled(self) -> bool:
+        return self.options.get(CONF_ENABLE_REPLY, True)
+
+    @property
+    def unlock_enabled(self) -> bool:
+        return self.options.get(CONF_ENABLE_UNLOCK, True)
+
+    @property
+    def ring_sensor_enabled(self) -> bool:
+        return self.options.get(CONF_ENABLE_RING_SENSOR, True)
+
+    @property
+    def reply_active(self) -> bool:
+        return self.reply.busy or self._reply_request is not None and not self._reply_request.done()
+
+    async def _watch_status(self):
+        previous = None
+        while True:
+            status = (self.mqtt_connected, self.video.call_status, self.reply_active)
+            if previous != status:
+                previous = status
+                self.notify_reply_state()
+            await asyncio.sleep(.25)
+
     async def async_play_reply(self) -> None:
-        filename = self.entry.options.get(CONF_REPLY_AUDIO_FILE, DEFAULT_REPLY_AUDIO_FILE)
+        if not self.reply_enabled:
+            raise RuntimeError("Quick reply is not enabled")
+        filename = self.options.get(CONF_REPLY_AUDIO_FILE, DEFAULT_REPLY_AUDIO_FILE)
         directory = Path(self.hass.config.path(REPLY_AUDIO_SUBDIR))
         await self.reply.play(directory, filename)
+
+    def start_reply(self) -> None:
+        if not self.reply_enabled or not self.mqtt_connected:
+            raise RuntimeError("Quick reply is unavailable")
+        if self.reply_active:
+            return
+        self._reply_request = self.hass.async_create_task(self.async_play_reply())
+        def finished(task):
+            if not task.cancelled() and task.exception():
+                _LOGGER.error("Quick reply failed: %s", task.exception())
+            if self._reply_request is task:
+                self._reply_request = None
+            self.notify_reply_state()
+        self._reply_request.add_done_callback(finished)
+        self.notify_reply_state()
+
+    async def async_stop_reply(self) -> None:
+        task = self._reply_request
+        if task and not task.done():
+            task.cancel()
+        await self.reply.stop()
+        if task:
+            await asyncio.gather(task, return_exceptions=True)
 
     async def async_start_monitor(
         self, duration_s: int = MONITOR_DEFAULT_DURATION_S
@@ -196,13 +262,15 @@ class AiphoneCoordinator:
         observed 23022/24022 transition instead. Signaling acceptance alone
         does not prove that audio RTP has arrived.
         """
-        if self.doorbell_state != STATE_RINGING and self.video._mon_cid:
+        ring = self._active_cid if self.doorbell_state == STATE_RINGING else None
+        lease = await self.video.async_viewer_track()
+        lease.stop()
+        if ring and self._active_cid != ring:
+            raise RuntimeError("The incoming call has ended")
+        if self.video._mon_cid:
             return await self.video.async_start_monitor_talk()
-        cid = self._active_cid if self.doorbell_state in (STATE_RINGING, STATE_ANSWERED) else None
-        if not cid:
-            _LOGGER.warning("answer_call: no active call/monitor to answer")
-            return False
-        return await self.video.async_answer_ring(cid)
+        cid = self.video.session_cid
+        return await self.video.async_answer_ring(cid) if cid else False
 
     def call_answered(self) -> None:
         self._cancel_timer()
@@ -216,11 +284,13 @@ class AiphoneCoordinator:
         self._set_doorbell(STATE_IDLE)
 
     async def async_hang_up(self) -> None:
-        await self.reply.stop()
+        await self.async_stop_reply()
         await self.video.async_hang_up()
 
     def async_unlock_door(self) -> None:
         """Send MID 26021 SET_UNLOCK_REQ. Unit auto-relocks after a few seconds."""
+        if not self.unlock_enabled:
+            raise RuntimeError("Unlock is not enabled")
         pcliid = self.sndtpc.rsplit("/", 1)[-1]
         self.publish({
             "HEADER": {
@@ -239,20 +309,27 @@ class AiphoneCoordinator:
     # -------------------------------------------------------------------
     @callback
     def _dispatch(self, raw: dict[str, Any]) -> None:
-        self.signal_trace.add("rx", raw)
+        if not isinstance(raw, dict):
+            return
         head = raw.get("HEADER", {}) or {}
         body = raw.get("BODY", {}) or {}
+        if not isinstance(head, dict) or not isinstance(body, dict):
+            return
+        self.signal_trace.add("rx", raw)
         flat = {**head, **body}
         mid = str(head.get("MID", ""))
         cid = head.get("CID")
 
+        if mid == "23001" and cid in self._seen_rings:
+            return
         # Resolve session-bound waiters before changing state. A response for
         # another CID can never complete an acceptance or release request.
         self.video.on_signal(mid, raw)
         self.reply.on_signal(mid, raw)
         if mid == "23001" and cid:
-            if cid == self._active_cid:  # MQTT QoS1 redelivery
-                return
+            if len(self._seen_rings) >= 128:
+                self._seen_rings.clear()
+            self._seen_rings.add(cid)
             self.last_caller = flat.get("DSP1") or "?"
             self.last_event = {
                 "ts": datetime.now(timezone.utc).isoformat(),
@@ -268,17 +345,28 @@ class AiphoneCoordinator:
             self.video._send("24000", cid, CKIND=self.call_kind, RSLT=200,
                              TMKIND=flat.get("TMKIND", 5), TMID=flat.get("TMID", 1281))
             self.hass.async_create_task(self._incoming_video(cid, self.last_caller))
-        elif cid and cid == self.video.session_cid:
+        elif cid and cid in (self.video.session_cid, self._active_cid):
             if mid in ("23003", "23004") and head.get("CLIID") != self.cliid:
+                # 23004 CALL_CANCEL_REQ is broadcast to every terminal when one
+                # answers. The official app (RelayManager.onSignalRcv) silently
+                # ignores it when NCID equals its own client id: it is the
+                # answerer, so it neither replies 24004 nor leaves the room.
+                if mid == "23004" and self._is_own_cancel(head, cid):
+                    return
                 self.video._send("24003" if mid == "23003" else "24004", cid,
                                  CKIND=self.call_kind, RSLT=200, REASON=head.get("REASON", 16))
+                self.call_ended(cid)
                 self.hass.async_create_task(self.video.async_hang_up(remote=True))
             elif mid == "24002" and str(head.get("RSLT")) == "200":
                 # An official app/indoor station took the call. Never hang up
                 # their conversation when releasing our own media subscription.
                 sender = head.get("CLIID")
                 if sender and sender != self.cliid:
+                    self.call_ended(cid)
                     self.hass.async_create_task(self.video.async_hang_up(remote=True))
+
+    def _is_own_cancel(self, head: dict[str, Any], cid: str) -> bool:
+        return self.video.is_own_cancel(head, cid)
 
     async def _incoming_video(self, cid: str, caller: str) -> None:
         if self.video._lock.locked():

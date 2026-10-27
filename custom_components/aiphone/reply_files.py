@@ -10,6 +10,8 @@ REPLY_EXTENSIONS = {".wav", ".mp3", ".m4a", ".ogg", ".flac"}
 def validate_reply_filename(filename: str) -> str:
     """Accept a basename, never an arbitrary path or URL."""
     filename = filename.strip()
+    if not filename:
+        return ""
     if (
         not filename
         or len(filename) > 128
@@ -26,6 +28,8 @@ def validate_reply_filename(filename: str) -> str:
 
 
 def resolve_reply_file(directory: Path, filename: str) -> Path:
+    if not filename.strip():
+        return Path(__file__).parent / "assets" / "jp_delivery.wav"
     root = directory.resolve()
     path = (root / validate_reply_filename(filename)).resolve()
     if path.parent != root:
