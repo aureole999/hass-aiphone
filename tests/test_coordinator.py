@@ -170,3 +170,86 @@ async def test_quick_reply_background_request_is_coalesced_and_can_be_stopped(co
     await coord.async_stop_reply()
     assert not coord.reply_active
     assert coord.doorbell_state == "idle"
+
+
+class LifecycleHost:
+    """Match HA's separate bootstrap and background task tracking."""
+
+    def __init__(self):
+        self.normal = set()
+        self.background = set()
+
+    def async_create_task(self, coroutine):
+        return self._create(coroutine, self.normal)
+
+    def async_create_background_task(self, coroutine, name):
+        return self._create(coroutine, self.background, name)
+
+    def _create(self, coroutine, bucket, name=None):
+        task = asyncio.create_task(coroutine, name=name)
+        bucket.add(task)
+        task.add_done_callback(bucket.discard)
+        return task
+
+    async def async_block_till_done(self):
+        while pending := [task for task in self.normal if not task.done()]:
+            await asyncio.gather(*pending)
+
+    async def shutdown(self):
+        tasks = tuple(self.background)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop_kind", ["unload", "shutdown"])
+async def test_status_loop_does_not_block_startup_and_is_cancelled_on_stop(coordinator, stop_kind):
+    coord, _, _ = coordinator
+    host = LifecycleHost()
+    coord.hass.async_create_task = host.async_create_task
+    coord.hass.async_add_executor_job = asyncio.to_thread
+    coord.entry.async_create_background_task = (
+        lambda hass, coroutine, name: host.async_create_background_task(coroutine, name)
+    )
+    coord._materialize_certs = lambda: None
+    coord._connect = lambda: None
+    coord.video.snapshot.load = AsyncMock()
+    coord.video.aclose = AsyncMock()
+    coord.async_stop_reply = AsyncMock()
+    try:
+        await host.async_create_task(coord.async_start())
+        await asyncio.wait_for(host.async_block_till_done(), .1)
+        status_task = coord._status_task
+        assert not status_task.done()
+        assert status_task in host.background
+        if stop_kind == "unload":
+            await asyncio.wait_for(coord.async_stop(), .1)
+            assert coord._status_task is None
+            coord.video.aclose.assert_awaited_once()
+        else:
+            await asyncio.wait_for(host.shutdown(), .1)
+        assert status_task.cancelled()
+        assert not host.background
+    finally:
+        await coord.async_stop()
+        await host.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_status_loop_keeps_publishing_changes_as_a_background_task(coordinator):
+    coord, _, _ = coordinator
+    notifications = []
+    coord.notify_reply_state = lambda: notifications.append(coord.video.call_status)
+    task = asyncio.create_task(coord._watch_status())
+    try:
+        await asyncio.sleep(0)
+        assert notifications == ["offline"]
+        coord._client = types.SimpleNamespace(is_connected=lambda: True)
+        await asyncio.sleep(.3)
+        assert notifications == ["offline", "idle"]
+        await asyncio.sleep(.3)
+        assert notifications == ["offline", "idle"]
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)

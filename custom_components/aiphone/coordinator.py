@@ -88,12 +88,16 @@ class AiphoneCoordinator:
         await self.video.snapshot.load()
         await self.hass.async_add_executor_job(self._materialize_certs)
         await self.hass.async_add_executor_job(self._connect)
-        self._status_task = self.hass.async_create_task(self._watch_status())
+        # This loop lives until unload; it must not join HA's startup wait set.
+        self._status_task = self.entry.async_create_background_task(
+            self.hass, self._watch_status(), "aiphone_status"
+        )
 
     async def async_stop(self) -> None:
-        if self._status_task:
-            self._status_task.cancel()
-            await asyncio.gather(self._status_task, return_exceptions=True)
+        status_task, self._status_task = self._status_task, None
+        if status_task:
+            status_task.cancel()
+            await asyncio.gather(status_task, return_exceptions=True)
         await self.async_stop_reply()
         await self.video.aclose()
         if self._client is not None:
